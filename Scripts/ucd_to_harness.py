@@ -14,20 +14,20 @@ UCD → Harness NG converter (multi-file, clean YAML, reusable templates)
 - Re-parses written YAML for quick validation.
 
 Examples:
-  # process a whole folder of exports
-  python Scripts/ucd_to_harness.py \
-    --input-dir ucd_input_files \
-    --out harness_out --org my_org --project my_project
 
-  # process specific files
-  python Scripts/ucd_to_harness.py \
-    --input ucd_input_files/a.json --input ucd_input_files/b.json \
-    --out harness_out --org my_org --project my_project
+Examples
+--------
+# Sweep a directory of UCD exports and group output per file
+python Scripts/ucd_to_harness.py \
+  --input-dir ucd_input_files --recursive \
+  --out harness_out --org my_org --project my_project \
+  --group-by file
 
-  # or comma-separated
-  python Scripts/ucd_to_harness.py \
-    --input ucd_input_files/a.json,ucd_input_files/b.json \
-    --out harness_out --org my_org --project my_project
+# Group by application name
+python Scripts/ucd_to_harness.py \
+  --input-dir ucd_input_files \
+  --out harness_out --org my_org --project my_project \
+  --group-by application
 """
 import os, re, sys, json, glob, argparse
 from typing import Any, Dict, List, Optional, Tuple
