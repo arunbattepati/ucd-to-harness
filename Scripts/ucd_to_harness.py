@@ -11,6 +11,7 @@ UCD → Harness NG converter (multi-file, clean YAML, reusable templates)
 - Ensures globally unique Service identifiers: {AppName}_{ComponentName}.
 - Injects orgIdentifier / projectIdentifier into top-level entities.
 - Matches reusable Step/StepGroup templates via .harness/template-registry.yaml.
+- Adds one FetchInstanceScript when deploymentType is CustomDeployment.
 - Re-parses written YAML for quick validation.
 
 Examples
@@ -32,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import yaml
-except Exception as e:
+except Exception:
     print("PyYAML is required: pip install pyyaml")
     raise
 
@@ -48,8 +49,7 @@ def sanitize_name(s: str) -> str:
     s = s.replace("/", " ").replace("\\", " ").replace("(", " ").replace(")", " ")
     s = re.sub(r"[^0-9A-Za-z_\-\s.]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    if not s:
-        s = "Name"
+    if not s: s = "Name"
     s = s[:128]
     if not NM_RE.match(s):
         s = s.lstrip()
@@ -69,8 +69,7 @@ def sanitize_identifier(s: str) -> str:
     if not ID_RE.match(s):
         s = "_" + re.sub(r"[^0-9A-Za-z_]", "_", s)
         s = re.sub(r"_+", "_", s).strip("_")[:128]
-        if not s:
-            s = "id"
+        if not s: s = "id"
     return s
 
 def _walk_fix_ids_and_names(obj: Any) -> None:
@@ -90,8 +89,8 @@ def _walk_fix_ids_and_names(obj: Any) -> None:
 # deploymentType normalization
 # --------------------------------------------------------------------
 VALID_DEPLOYMENT_TYPES = {
-    "CustomDeployment", "WinRm", "TAS", "Kubernetes", "SSH", "NativeHelm",
-    "ECS", "AzureWebApp", "ServerlessAwsLambda", "GoogleCloudRun"
+    "CustomDeployment","WinRm","TAS","Kubernetes","SSH","NativeHelm","ECS",
+    "AzureWebApp","ServerlessAwsLambda","GoogleCloudRun"
 }
 SYNONYMS = {
     "pcf": "TAS", "tanzu": "TAS", "cloud foundry": "TAS", "tas": "TAS",
@@ -102,28 +101,23 @@ SYNONYMS = {
 def infer_deployment_type(app_tags: List[str], comp_tags: List[str]) -> str:
     hay = " ".join(app_tags + comp_tags).lower()
     for key, val in SYNONYMS.items():
-        if key in hay:
-            return val
+        if key in hay: return val
     return "CustomDeployment"
 
 def normalize_deployment_type(dt: Optional[str]) -> str:
-    if not dt:
-        return "CustomDeployment"
-    if dt not in VALID_DEPLOYMENT_TYPES:
-        low = dt.lower()
-        for k, v in SYNONYMS.items():
-            if k == low:
-                return v
-        return "CustomDeployment"
-    return dt
+    if not dt: return "CustomDeployment"
+    if dt in VALID_DEPLOYMENT_TYPES: return dt
+    low = dt.lower()
+    for k, v in SYNONYMS.items():
+        if k == low: return v
+    return "CustomDeployment"
 
 # --------------------------------------------------------------------
 # YAML write with validation and meta injection
 # --------------------------------------------------------------------
 def ensure_meta(payload: Dict[str, Any], kind: str, org: str, proj: str) -> None:
     node = payload.get(kind)
-    if not isinstance(node, dict):
-        return
+    if not isinstance(node, dict): return
     node.setdefault("orgIdentifier", org)
     node.setdefault("projectIdentifier", proj)
     if "name" in node and isinstance(node["name"], str):
@@ -165,8 +159,7 @@ def collect_tags_map(tag_objs: List[Dict[str, Any]]) -> Dict[str, str]:
     for t in tag_objs or []:
         raw = t.get("name") if isinstance(t, dict) else str(t)
         k, v = _parse_tag(str(raw))
-        if k:
-            tags[k] = v
+        if k: tags[k] = v
     return tags
 
 def collect_tags_flat(tag_objs: List[Dict[str, Any]]) -> List[str]:
@@ -177,13 +170,13 @@ def collect_tags_flat(tag_objs: List[Dict[str, Any]]) -> List[str]:
     return flat
 
 # --------------------------------------------------------------------
-# Template registry (optional step/stepgroup)
+# Template registry (Step or StepGroup)
 # --------------------------------------------------------------------
 def load_registry(path: Optional[str]) -> List[Dict[str, Any]]:
     """
-    Registry format examples (all accepted):
-    - node: step | stepGroup
-    - type: Step | StepTemplate | StepGroup | StepGroupTemplate
+    Accepts either:
+      node: step | stepGroup
+    or  type: Step | StepTemplate | StepGroup | StepGroupTemplate
     """
     if not path or not os.path.exists(path):
         return []
@@ -194,20 +187,15 @@ def load_registry(path: Optional[str]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
 
     def resolve_node(d: Dict[str, Any]) -> str:
-        # Primary key the old script used
         node = (d.get("node") or d.get("kind") or "").strip().lower()
-        # Accept "type" too (as in your registry)
-        t = (d.get("type") or "").strip().lower()
-        # Normalize
+        type_hint = (d.get("type") or "").strip().lower()
         if node in ("step", "stepgroup"):
-            pass
-        elif t in ("step", "steptemplate", "stepref", "steptemplateref"):
-            node = "step"
-        elif t in ("stepgroup", "group", "stepgrouptemplate", "stepgroupref"):
-            node = "stepGroup"
-        else:
-            node = "stepGroup"  # default
-        return node
+            return "step" if node == "step" else "stepGroup"
+        if type_hint in ("step", "steptemplate", "stepref", "steptemplateref"):
+            return "step"
+        if type_hint in ("stepgroup", "group", "stepgrouptemplate", "stepgroupref"):
+            return "stepGroup"
+        return "stepGroup"
 
     for it in items:
         if not isinstance(it, dict):
@@ -232,8 +220,7 @@ def load_registry(path: Optional[str]) -> List[Dict[str, Any]]:
 def _regex_any(pats: List[str], hay: str) -> bool:
     for p in pats:
         try:
-            if re.search(p, hay, re.IGNORECASE):
-                return True
+            if re.search(p, hay, re.IGNORECASE): return True
         except re.error:
             pass
     return False
@@ -241,18 +228,15 @@ def _regex_any(pats: List[str], hay: str) -> bool:
 def _regex_all(pats: List[str], hay: str) -> bool:
     for p in pats:
         try:
-            if not re.search(p, hay, re.IGNORECASE):
-                return False
+            if not re.search(p, hay, re.IGNORECASE): return False
         except re.error:
             return False
     return True
 
 def _build_template_inputs(inputs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not inputs:
-        return None
+    if not inputs: return None
     vmap = inputs.get("variables") or {}
-    if not vmap:
-        return None
+    if not vmap: return None
     return {"variables": [{"name": str(k), "type": "String", "value": str(v)} for k, v in vmap.items()]}
 
 def match_templates_for_component(app_name: str, comp_name: str,
@@ -273,8 +257,8 @@ def match_templates_for_component(app_name: str, comp_name: str,
         if ok and m.get("all_regex"): ok = ok and _regex_all(m["all_regex"], hay)
         if ok:
             spec = {
-                "node": rule["node"],  # 'step' or 'stepGroup'
                 "name": rule["name"],
+                "node": rule.get("node", "stepGroup"),
                 "templateRef": rule["templateRef"],
                 "versionLabel": rule.get("versionLabel", "v1")
             }
@@ -290,7 +274,7 @@ def match_templates_for_component(app_name: str, comp_name: str,
 # Builders
 # --------------------------------------------------------------------
 def build_service_payload(name: str, identifier: str, tags_map: Dict[str, str]) -> Dict[str, Any]:
-    # CustomDeployment requires customDeploymentRef; keep as runtime input by default.
+    # CustomDeployment + customDeploymentRef fixes service schema expectations
     return {
         "service": {
             "name": sanitize_name(name),
@@ -299,7 +283,7 @@ def build_service_payload(name: str, identifier: str, tags_map: Dict[str, str]) 
             "serviceDefinition": {
                 "type": "CustomDeployment",
                 "spec": {
-                    "customDeploymentRef": "<+input>",
+                    "customDeploymentRef": "<+input>",   # choose at import/run time, or replace with your template id
                     "variables": []
                 }
             }
@@ -307,7 +291,7 @@ def build_service_payload(name: str, identifier: str, tags_map: Dict[str, str]) 
     }
 
 def _fetch_instance_step() -> Dict[str, Any]:
-    """Minimal Fetch Instance step (required once for CustomDeployment)."""
+    """One required FetchInstanceScript per CustomDeployment stage."""
     return {
         "step": {
             "name": "Fetch Instances",
@@ -362,40 +346,37 @@ def build_stage_for_component(svc_identifier: str,
     }
     steps = stage["stage"]["spec"]["execution"]["steps"]
 
-    # Required once for CustomDeployment
+    # Required for CustomDeployment stages (exactly once)
     if dt == "CustomDeployment":
         steps.append(_fetch_instance_step())
 
-    # Render matched templates as step OR stepGroup
-    for mt in matched_templates:
-        node = mt.get("node", "stepGroup")
-        block: Dict[str, Any]
+    # Emit step or stepGroup blocks per registry
+    for sg in matched_templates:
+        sg_name = sg["name"]
+        node = (sg.get("node") or "stepGroup").strip()
+        template_block = {
+            "templateRef": sg["templateRef"],
+            "versionLabel": sg.get("versionLabel", "v1")
+        }
+        if "templateInputs" in sg:
+            template_block["templateInputs"] = sg["templateInputs"]
+
         if node == "step":
             block = {
                 "step": {
-                    "name": sanitize_name(mt["name"]),
-                    "identifier": sanitize_identifier(mt["name"]),
-                    "template": {
-                        "templateRef": mt["templateRef"],
-                        "versionLabel": mt.get("versionLabel", "v1")
-                    }
+                    "name": sanitize_name(sg_name),
+                    "identifier": sanitize_identifier(sg_name),
+                    "template": template_block
                 }
             }
-            if "templateInputs" in mt:
-                block["step"]["template"]["templateInputs"] = mt["templateInputs"]
-        else:  # stepGroup (default)
+        else:
             block = {
                 "stepGroup": {
-                    "name": sanitize_name(mt["name"]),
-                    "identifier": sanitize_identifier(mt["name"]),
-                    "template": {
-                        "templateRef": mt["templateRef"],
-                        "versionLabel": mt.get("versionLabel", "v1")
-                    }
+                    "name": sanitize_name(sg_name),
+                    "identifier": sanitize_identifier(sg_name),
+                    "template": template_block
                 }
             }
-            if "templateInputs" in mt:
-                block["stepGroup"]["template"]["templateInputs"] = mt["templateInputs"]
         steps.append(block)
 
     # Terminal placeholder (safe no-op)
@@ -531,7 +512,6 @@ def main() -> None:
                 comp_tags_flat = collect_tags_flat(comp.get("tags") or [])
                 comp_tags_map  = collect_tags_map(comp.get("tags") or [])
 
-                # globally unique service id: {App}_{Component}
                 svc_identifier = sanitize_identifier(f"{app_name}_{comp_name}")
 
                 svc_yaml = build_service_payload(comp_name, svc_identifier, {**app_tags_map, **comp_tags_map})
@@ -539,9 +519,7 @@ def main() -> None:
                 write_yaml(svc_path, svc_yaml, args.org, args.project)
                 svc_count += 1; file_svcs += 1
 
-                matched = match_templates_for_component(
-                    app_name, comp_name, app_tags_flat, comp_tags_flat, registry, first_match=args.first_match
-                )
+                matched = match_templates_for_component(app_name, comp_name, app_tags_flat, comp_tags_flat, registry, first_match=args.first_match)
                 deployment_type = infer_deployment_type(app_tags_flat, comp_tags_flat)
 
                 stage_name = f"Deploy {comp_name}"
