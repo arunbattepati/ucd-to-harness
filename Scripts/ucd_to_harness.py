@@ -284,8 +284,11 @@ def build_service_payload(name: str, identifier: str, tags_map: Dict[str, str]) 
             "identifier": sanitize_identifier(identifier),
             "tags": tags_map or {},
             "serviceDefinition": {
-                "type": "Custom",
-                "spec": {"variables": []}
+                "type": "CustomDeployment",
+                "spec": {
+                    "customDeploymentRef": "<+input>",
+                    "variables": []
+                }
             }
         }
     }
