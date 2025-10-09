@@ -10,7 +10,7 @@ UCD → Harness NG converter (multi-file, clean YAML, reusable templates)
 - Sanitizes all identifiers to [A-Za-z0-9_]{1,128}.
 - Ensures globally unique Service identifiers: {AppName}_{ComponentName}.
 - Injects orgIdentifier / projectIdentifier into top-level entities.
-- Matches reusable StepGroup templates via .harness/template-registry.yaml.
+- Matches reusable Step/StepGroup templates via .harness/template-registry.yaml.
 - Re-parses written YAML for quick validation.
 
 Examples
@@ -37,35 +37,26 @@ except Exception as e:
     raise
 
 # --------------------------------------------------------------------
-# Harness validators (from field feedback)
-# identifier: ^[a-zA-Z_][0-9a-zA-Z_]{0,127}$
-# name:       ^[a-zA-Z_0-9-.][-0-9a-zA-Z_\\s.]{0,127}$
-# (Also: remove '/', '\\', '(', ')' and other illegal chars in names)
+# Harness validators
 # --------------------------------------------------------------------
 ID_RE  = re.compile(r"^[A-Za-z_][0-9A-Za-z_]{0,127}$")
 NM_RE  = re.compile(r"^[A-Za-z_0-9-.][-0-9A-Za-z_\s.]{0,127}$")
 ID_SAN = re.compile(r"[^0-9A-Za-z_]+")
-# For names we allow letters/digits/underscore/hyphen/space/dot
+
 def sanitize_name(s: str) -> str:
     s = (s or "Name").strip()
-    # remove forbidden chars explicitly mentioned: / \ ( )
     s = s.replace("/", " ").replace("\\", " ").replace("(", " ").replace(")", " ")
-    # collapse weird punctuation to space
     s = re.sub(r"[^0-9A-Za-z_\-\s.]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     if not s:
         s = "Name"
-    # enforce length
     s = s[:128]
-    # if still not matching, prefix with '_' and strip leading spaces
     if not NM_RE.match(s):
         s = s.lstrip()
         if not s or not re.match(r"[A-Za-z_0-9-.]", s[0]):
             s = "_" + s
         s = s[:128]
-    # final guard
     if not NM_RE.match(s):
-        # fallback to an identifier-based readable name
         s = re.sub(r"_+", " ", ID_SAN.sub("_", s))[:128] or "Name"
     return s
 
@@ -76,7 +67,6 @@ def sanitize_identifier(s: str) -> str:
         s = "_" + s
     s = re.sub(r"_+", "_", s).strip("_")[:128]
     if not ID_RE.match(s):
-        # last-resort: ensure valid start and content
         s = "_" + re.sub(r"[^0-9A-Za-z_]", "_", s)
         s = re.sub(r"_+", "_", s).strip("_")[:128]
         if not s:
@@ -84,7 +74,6 @@ def sanitize_identifier(s: str) -> str:
     return s
 
 def _walk_fix_ids_and_names(obj: Any) -> None:
-    """Recursively enforce identifier and name validity throughout the document."""
     if isinstance(obj, dict):
         for k, v in list(obj.items()):
             if k == "identifier" and isinstance(v, str) and not ID_RE.match(v):
@@ -101,8 +90,8 @@ def _walk_fix_ids_and_names(obj: Any) -> None:
 # deploymentType normalization
 # --------------------------------------------------------------------
 VALID_DEPLOYMENT_TYPES = {
-    # keep a conservative list; fall back to Custom when unsure
-    "CustomDeployment", "WinRm", "TAS", "Kubernetes", "SSH", "NativeHelm", "ECS", "AzureWebApp", "ServerlessAwsLambda", "GoogleCloudRun"
+    "CustomDeployment", "WinRm", "TAS", "Kubernetes", "SSH", "NativeHelm",
+    "ECS", "AzureWebApp", "ServerlessAwsLambda", "GoogleCloudRun"
 }
 SYNONYMS = {
     "pcf": "TAS", "tanzu": "TAS", "cloud foundry": "TAS", "tas": "TAS",
@@ -121,7 +110,6 @@ def normalize_deployment_type(dt: Optional[str]) -> str:
     if not dt:
         return "CustomDeployment"
     if dt not in VALID_DEPLOYMENT_TYPES:
-        # try mapping synonyms
         low = dt.lower()
         for k, v in SYNONYMS.items():
             if k == low:
@@ -138,7 +126,6 @@ def ensure_meta(payload: Dict[str, Any], kind: str, org: str, proj: str) -> None
         return
     node.setdefault("orgIdentifier", org)
     node.setdefault("projectIdentifier", proj)
-    # Top-level name/id
     if "name" in node and isinstance(node["name"], str):
         node["name"] = sanitize_name(node["name"])
     if "identifier" in node:
@@ -149,17 +136,13 @@ def ensure_meta(payload: Dict[str, Any], kind: str, org: str, proj: str) -> None
 
 def write_yaml(path: str, payload: Dict[str, Any], org: str, proj: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # inject meta
     for top in ("pipeline", "service", "template", "environment", "infrastructureDefinition"):
         if top in payload:
             ensure_meta(payload, top, org, proj)
-    # sanitize across the tree (names and identifiers)
     _walk_fix_ids_and_names(payload)
-    # dump + parse-back validation
     text = yaml.safe_dump(payload, sort_keys=False, default_flow_style=False)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
-    # re-parse to guarantee valid YAML
     with open(path, "r", encoding="utf-8") as f:
         yaml.safe_load(f)
 
@@ -194,9 +177,23 @@ def collect_tags_flat(tag_objs: List[Dict[str, Any]]) -> List[str]:
     return flat
 
 # --------------------------------------------------------------------
-# Template registry (optional stepgroups)
+# Template registry (optional step/stepgroup)
 # --------------------------------------------------------------------
 def load_registry(path: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Registry format example:
+    templates:
+      - name: Gradle Build
+        node: step            # 'step' or 'stepGroup' (default 'stepGroup')
+        templateRef: Java_Gradle_Build
+        versionLabel: v1
+        match:
+          any_regex: ["gradle|jar|war"]
+          tags_any:  ["build:gradle"]
+        inputs:
+          variables:
+            artifactPath: "<+input>"
+    """
     if not path or not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as f:
@@ -207,8 +204,12 @@ def load_registry(path: Optional[str]) -> List[Dict[str, Any]]:
         if not isinstance(it, dict):
             continue
         m = it.get("match") or {}
+        node = (it.get("node") or it.get("kind") or "stepGroup").strip()
+        if node not in ("step", "stepGroup"):
+            node = "stepGroup"
         out.append({
-            "name": it.get("name") or it.get("templateRef") or "StepGroup",
+            "name": it.get("name") or it.get("templateRef") or "Template",
+            "node": node,  # 'step' or 'stepGroup'
             "templateRef": it.get("templateRef"),
             "versionLabel": it.get("versionLabel", "v1"),
             "match": {
@@ -247,10 +248,10 @@ def _build_template_inputs(inputs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     return {"variables": [{"name": str(k), "type": "String", "value": str(v)} for k, v in vmap.items()]}
 
-def match_stepgroups_for_component(app_name: str, comp_name: str,
-                                   app_tags: List[str], comp_tags: List[str],
-                                   registry: List[Dict[str, Any]],
-                                   first_match: bool=False) -> List[Dict[str, Any]]:
+def match_templates_for_component(app_name: str, comp_name: str,
+                                  app_tags: List[str], comp_tags: List[str],
+                                  registry: List[Dict[str, Any]],
+                                  first_match: bool=False) -> List[Dict[str, Any]]:
     tags_set = set([t.lower() for t in app_tags + comp_tags])
     hay = " ".join([app_name, comp_name] + app_tags + comp_tags)
     matched: List[Dict[str, Any]] = []
@@ -264,7 +265,12 @@ def match_stepgroups_for_component(app_name: str, comp_name: str,
         if ok and m.get("any_regex"): ok = ok and _regex_any(m["any_regex"], hay)
         if ok and m.get("all_regex"): ok = ok and _regex_all(m["all_regex"], hay)
         if ok:
-            spec = {"name": rule["name"], "templateRef": rule["templateRef"], "versionLabel": rule["versionLabel"]}
+            spec = {
+                "node": rule["node"],  # 'step' or 'stepGroup'
+                "name": rule["name"],
+                "templateRef": rule["templateRef"],
+                "versionLabel": rule.get("versionLabel", "v1")
+            }
             ti = _build_template_inputs(rule.get("inputs") or {})
             if ti:
                 spec["templateInputs"] = ti
@@ -277,7 +283,7 @@ def match_stepgroups_for_component(app_name: str, comp_name: str,
 # Builders
 # --------------------------------------------------------------------
 def build_service_payload(name: str, identifier: str, tags_map: Dict[str, str]) -> Dict[str, Any]:
-    # Keep "Custom" serviceDefinition for broad compatibility on import.
+    # CustomDeployment requires customDeploymentRef; keep as runtime input by default.
     return {
         "service": {
             "name": sanitize_name(name),
@@ -294,7 +300,7 @@ def build_service_payload(name: str, identifier: str, tags_map: Dict[str, str]) 
     }
 
 def _fetch_instance_step() -> Dict[str, Any]:
-    """PATCH: Required once per CustomDeployment stage to satisfy Harness validator."""
+    """Minimal Fetch Instance step (required once for CustomDeployment)."""
     return {
         "step": {
             "name": "Fetch Instances",
@@ -307,7 +313,6 @@ def _fetch_instance_step() -> Dict[str, Any]:
                 "source": {
                     "type": "Inline",
                     "spec": {
-                        # Minimal valid output; replace with real discovery as you implement
                         "script": (
                             'echo "Fetching instances for $HARNESS_SERVICE_NAME..."\n'
                             'echo \'{"instances":[{"name":"sample-instance","id":"1"}]}\'\n'
@@ -321,7 +326,7 @@ def _fetch_instance_step() -> Dict[str, Any]:
 def build_stage_for_component(svc_identifier: str,
                               stage_name: str,
                               deployment_type: str,
-                              matched_stepgroups: List[Dict[str, Any]]) -> Dict[str, Any]:
+                              matched_templates: List[Dict[str, Any]]) -> Dict[str, Any]:
     dt = normalize_deployment_type(deployment_type)
     stage = {
         "stage": {
@@ -338,7 +343,6 @@ def build_stage_for_component(svc_identifier: str,
                 },
                 "execution": {"steps": []},
             },
-            # safe default failure strategy to avoid editor prompts
             "failureStrategies": [
                 {
                     "onFailure": {
@@ -351,25 +355,40 @@ def build_stage_for_component(svc_identifier: str,
     }
     steps = stage["stage"]["spec"]["execution"]["steps"]
 
-    # --- PATCH: Inject exactly one FetchInstanceScript for CustomDeployment ---
+    # Required once for CustomDeployment
     if dt == "CustomDeployment":
         steps.append(_fetch_instance_step())
 
-    # Matched reusable StepGroups from registry
-    for sg in matched_stepgroups:
-        sg_name = sg["name"]
-        block = {
-            "stepGroup": {
-                "name": sanitize_name(sg_name),
-                "identifier": sanitize_identifier(sg_name),
-                "template": {
-                    "templateRef": sg["templateRef"],
-                    "versionLabel": sg.get("versionLabel", "v1")
+    # Render matched templates as step OR stepGroup
+    for mt in matched_templates:
+        node = mt.get("node", "stepGroup")
+        block: Dict[str, Any]
+        if node == "step":
+            block = {
+                "step": {
+                    "name": sanitize_name(mt["name"]),
+                    "identifier": sanitize_identifier(mt["name"]),
+                    "template": {
+                        "templateRef": mt["templateRef"],
+                        "versionLabel": mt.get("versionLabel", "v1")
+                    }
                 }
             }
-        }
-        if "templateInputs" in sg:
-            block["stepGroup"]["template"]["templateInputs"] = sg["templateInputs"]
+            if "templateInputs" in mt:
+                block["step"]["template"]["templateInputs"] = mt["templateInputs"]
+        else:  # stepGroup (default)
+            block = {
+                "stepGroup": {
+                    "name": sanitize_name(mt["name"]),
+                    "identifier": sanitize_identifier(mt["name"]),
+                    "template": {
+                        "templateRef": mt["templateRef"],
+                        "versionLabel": mt.get("versionLabel", "v1")
+                    }
+                }
+            }
+            if "templateInputs" in mt:
+                block["stepGroup"]["template"]["templateInputs"] = mt["templateInputs"]
         steps.append(block)
 
     # Terminal placeholder (safe no-op)
@@ -408,7 +427,6 @@ def build_pipeline_payload(pipeline_name: str,
 # --------------------------------------------------------------------
 def collect_input_files(inputs: List[str], input_dir: Optional[str], glob_pattern: str, recursive: bool) -> List[str]:
     files: List[str] = []
-    # explicit files (allow comma-separated and repeated flags)
     for item in inputs or []:
         for part in [p.strip() for p in item.split(",") if p.strip()]:
             if os.path.isdir(part):
@@ -419,7 +437,6 @@ def collect_input_files(inputs: List[str], input_dir: Optional[str], glob_patter
     if input_dir:
         pattern = os.path.join(input_dir, "**", glob_pattern) if recursive else os.path.join(input_dir, glob_pattern)
         files.extend(glob.glob(pattern, recursive=recursive))
-    # normalize & de-dup
     normed, seen = [], set()
     for f in files:
         p = os.path.abspath(f)
@@ -515,7 +532,9 @@ def main() -> None:
                 write_yaml(svc_path, svc_yaml, args.org, args.project)
                 svc_count += 1; file_svcs += 1
 
-                matched = match_stepgroups_for_component(app_name, comp_name, app_tags_flat, comp_tags_flat, registry, first_match=args.first_match)
+                matched = match_templates_for_component(
+                    app_name, comp_name, app_tags_flat, comp_tags_flat, registry, first_match=args.first_match
+                )
                 deployment_type = infer_deployment_type(app_tags_flat, comp_tags_flat)
 
                 stage_name = f"Deploy {comp_name}"
