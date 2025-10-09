@@ -181,32 +181,39 @@ def collect_tags_flat(tag_objs: List[Dict[str, Any]]) -> List[str]:
 # --------------------------------------------------------------------
 def load_registry(path: Optional[str]) -> List[Dict[str, Any]]:
     """
-    Registry format example:
-    templates:
-      - name: Gradle Build
-        node: step            # 'step' or 'stepGroup' (default 'stepGroup')
-        templateRef: Java_Gradle_Build
-        versionLabel: v1
-        match:
-          any_regex: ["gradle|jar|war"]
-          tags_any:  ["build:gradle"]
-        inputs:
-          variables:
-            artifactPath: "<+input>"
+    Registry format examples (all accepted):
+    - node: step | stepGroup
+    - type: Step | StepTemplate | StepGroup | StepGroupTemplate
     """
     if not path or not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
+
     items = data.get("templates") or []
     out: List[Dict[str, Any]] = []
+
+    def resolve_node(d: Dict[str, Any]) -> str:
+        # Primary key the old script used
+        node = (d.get("node") or d.get("kind") or "").strip().lower()
+        # Accept "type" too (as in your registry)
+        t = (d.get("type") or "").strip().lower()
+        # Normalize
+        if node in ("step", "stepgroup"):
+            pass
+        elif t in ("step", "steptemplate", "stepref", "steptemplateref"):
+            node = "step"
+        elif t in ("stepgroup", "group", "stepgrouptemplate", "stepgroupref"):
+            node = "stepGroup"
+        else:
+            node = "stepGroup"  # default
+        return node
+
     for it in items:
         if not isinstance(it, dict):
             continue
         m = it.get("match") or {}
-        node = (it.get("node") or it.get("kind") or "stepGroup").strip()
-        if node not in ("step", "stepGroup"):
-            node = "stepGroup"
+        node = resolve_node(it)
         out.append({
             "name": it.get("name") or it.get("templateRef") or "Template",
             "node": node,  # 'step' or 'stepGroup'
