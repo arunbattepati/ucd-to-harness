@@ -1,487 +1,651 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-UCD → Harness YAML Converter (import-ready; no manual edits required)
+UCD → Harness NG converter (single global _common templates pack)
 
-Key features:
-- Recursively reads input dir (supports nested folders).
-- Accepts many UCD shapes: {"applications":[...]}, {"Applications":[...]}, {"ucdExport":{...}},
-  or single-entity files (pipeline/template/service/environment/infrastructureDefinition/inputSet).
-- Outputs to:
-    <out>/common_templates/
-    <out>/<app>/{services,environments,infrastructures,pipelines,input_sets}/
-- Ensures Harness-importable YAML (--- header, .yaml extension, sanitized identifiers).
-- Adds --verbose to print per-file stats & warnings.
+- Creates ONE shared templates pack at: <OUT>/_common/.harness/templates/step-groups/*.yaml
+- Creates ONE shared registry at:      <OUT>/.harness/template-registry.yaml
+- Generates per-group (application/file/none) Services and Pipelines that reference those shared templates
+- Injects exactly one FetchInstanceScript as the first step in every CustomDeployment stage
+- Service YAML uses: serviceDefinition.type: CustomDeployment (no customDeploymentRef)
 
-Usage:
-  python Scripts/ucd_to_harness_yaml_converter.py \
-    --input-dir ucd_input_files \
-    --out harness_out \
-    --org default \
-    --project ucd2harnessmigration \
-    --group-by application \
-    --verbose
+Run
+---
+python Scripts/ucd_to_harness_yaml_converter.py \
+  --input-dir ucd_input_files \
+  --out harness_out \
+  --org default \
+  --project ucd2harnessmigration \
+  --group-by application \
+  --recursive \
+  --verbose
 """
-
-from __future__ import annotations
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
-import argparse
-import json
-import re
-import sys
+import os, re, sys, json, glob, argparse
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 try:
-    import yaml  # PyYAML
+    import yaml
 except Exception:
-    print("ERROR: PyYAML is required. Install with: pip install pyyaml", file=sys.stderr)
+    print("PyYAML is required: pip install pyyaml")
     raise
 
-SUPPORTED_TOP_KEYS = {
-    "template",
-    "service",
-    "environment",
-    "infrastructureDefinition",
-    "pipeline",
-    "inputSet",
-}
+# ------------------ validators & sanitizers ------------------
+ID_RE  = re.compile(r"^[A-Za-z_][0-9A-Za-z_]{0,127}$")
+NM_RE  = re.compile(r"^[A-Za-z_][-0-9A-Za-z_\\s]{0,127}$")
+ID_SAN = re.compile(r"[^0-9A-Za-z_]+")
 
-_IDENT_RX_ALLOWED = re.compile(r"[^A-Za-z0-9_]")
-_IDENT_RX_LEAD = re.compile(r"^[A-Za-z]")
-
-def to_identifier(s: str) -> str:
-    s = (s or "").strip()
-    s = _IDENT_RX_ALLOWED.sub("_", s)
-    s = re.sub(r"_+", "_", s)
-    if not _IDENT_RX_LEAD.match(s):
-        s = f"A_{s}" if s else "A_auto"
+def sanitize_identifier(s: str) -> str:
+    s = (s or "id").strip()
+    s = ID_SAN.sub("_", s)
+    if not s or not re.match(r"[A-Za-z_]", s[0]):
+        s = "_" + s
+    s = re.sub(r"_+", "_", s).strip("_")[:128]
+    if not ID_RE.match(s):
+        s = "_" + re.sub(r"[^0-9A-Za-z_]", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")[:128]
+        if not s:
+            s = "id"
     return s
 
-def to_safe_filename(*parts: str) -> str:
-    segs = [to_identifier(p) for p in parts if p]
-    base = "_".join(segs) or "artifact"
-    return f"{base}.yaml"
+def sanitize_name(s: str) -> str:
+    s = (s or "Name")
+    s = re.sub(r"[^0-9A-Za-z_\\-\\s.]+", " ", s)
+    s = s.replace(".", " ")
+    s = re.sub(r"\\s+", " ", s).strip()
+    if not s or not re.match(r"[A-Za-z_]", s[0]):
+        s = "_" + s
+    s = re.sub(r"[^-0-9A-Za-z_\\s]", " ", s)
+    s = re.sub(r"\\s+", " ", s).strip()[:128]
+    if not NM_RE.match(s):
+        s = "_" + re.sub(r"[^-0-9A-Za-z_\\s]", " ", s)
+        s = re.sub(r"\\s+", " ", s).strip()[:128]
+    return s
 
-def yaml_write(path: Path, obj: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not str(path).lower().endswith(".yaml"):
-        path = path.with_suffix(".yaml")
-    with path.open("w", encoding="utf-8") as f:
-        f.write("---\n")
-        yaml.safe_dump(obj, f, sort_keys=False)
+def _walk_fix_ids_and_names(obj: Any) -> None:
+    if isinstance(obj, dict):
+        for k, v in list(obj.items()):
+            if k == "identifier" and isinstance(v, str) and not ID_RE.match(v):
+                obj[k] = sanitize_identifier(v)
+            if k == "name" and isinstance(v, str):
+                obj[k] = sanitize_name(v)
+        for v in obj.values():
+            _walk_fix_ids_and_names(v)
+    elif isinstance(obj, list):
+        for i in obj:
+            _walk_fix_ids_and_names(i)
 
-class Writer:
-    def __init__(self, out_root: Path) -> None:
-        self.root = out_root
-        self.common_dir = self.root / "common_templates"
-        self.common_dir.mkdir(parents=True, exist_ok=True)
-        self._template_id_seen: set[str] = set()
-
-    def _app_dir(self, app: str) -> Path:
-        safe = to_identifier(app.strip().lstrip(".").replace(" ", "_"))
-        d = self.root / safe
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-
-    def write_template(self, tpl: dict) -> Optional[Path]:
-        t = tpl["template"]
-        t["identifier"] = to_identifier(t.get("identifier") or t.get("name") or "Template")
-        ident = t["identifier"]
-        if ident in self._template_id_seen:
-            return None
-        self._template_id_seen.add(ident)
-        out = self.common_dir / to_safe_filename(ident)
-        yaml_write(out, {"template": t})
-        return out
-
-    def write_service(self, app: str, svc: dict) -> Path:
-        s = svc["service"]
-        s["identifier"] = to_identifier(s.get("identifier") or s.get("name") or f"{app}_service")
-        out = self._app_dir(app) / "services" / to_safe_filename(app, s["identifier"])
-        yaml_write(out, {"service": s})
-        return out
-
-    def write_environment(self, app: str, env: dict) -> Path:
-        e = env["environment"]
-        e["identifier"] = to_identifier(e.get("identifier") or e.get("name") or f"{app}_env")
-        out = self._app_dir(app) / "environments" / to_safe_filename(app, e["identifier"])
-        yaml_write(out, {"environment": e})
-        return out
-
-    def write_infrastructure(self, app: str, infra: dict) -> Path:
-        key = "infrastructureDefinition"
-        i = infra[key]
-        i["identifier"] = to_identifier(i.get("identifier") or i.get("name") or f"{app}_infra")
-        out = self._app_dir(app) / "infrastructures" / to_safe_filename(app, i["identifier"])
-        yaml_write(out, {key: i})
-        return out
-
-    def write_pipeline(self, app: str, pipe: dict) -> Path:
-        p = pipe["pipeline"]
-        p["identifier"] = to_identifier(p.get("identifier") or p.get("name") or f"{app}_pipeline")
-        out = self._app_dir(app) / "pipelines" / to_safe_filename(app, p["identifier"])
-        yaml_write(out, {"pipeline": p})
-        return out
-
-    def write_input_set(self, app: str, input_set: dict) -> Path:
-        i = input_set["inputSet"]
-        i["identifier"] = to_identifier(i.get("identifier") or i.get("name") or f"{app}_inputs")
-        out = self._app_dir(app) / "input_sets" / to_safe_filename(app, i["identifier"])
-        yaml_write(out, {"inputSet": i})
-        return out
-
-def ensure_org_project(entity: dict, org: str, project: str) -> None:
-    keys = [k for k in entity.keys() if k in SUPPORTED_TOP_KEYS]
-    if not keys:
+# ------------------ yaml helpers ------------------
+def ensure_meta(payload: Dict[str, Any], kind: str, org: str, proj: str) -> None:
+    node = payload.get(kind)
+    if not isinstance(node, dict):
         return
-    k = keys[0]
-    body = entity[k]
-    if not isinstance(body, dict):
-        return
-    if "orgIdentifier" not in body:
-        body["orgIdentifier"] = org
-    if "projectIdentifier" not in body and k != "template":
-        body["projectIdentifier"] = project
+    node.setdefault("orgIdentifier", org)
+    # templates may be org/project scoped; leaving projectIdentifier when absent is okay
+    if kind != "template":
+        node.setdefault("projectIdentifier", proj)
+    if "name" in node and isinstance(node["name"], str):
+        node["name"] = sanitize_name(node["name"])
+    if "identifier" in node:
+        if not isinstance(node["identifier"], str) or not ID_RE.match(node["identifier"]):
+            node["identifier"] = sanitize_identifier(str(node["identifier"]))
+    elif "name" in node:
+        node["identifier"] = sanitize_identifier(str(node["name"]))
 
-def normalize_identifiers(entity: dict, app: str) -> None:
-    keys = [k for k in entity.keys() if k in SUPPORTED_TOP_KEYS]
-    if not keys:
-        return
-    k = keys[0]
-    body = entity[k]
-    if not isinstance(body, dict):
-        return
-    default_suffix = {
-        "template": "Template",
-        "service": "service",
-        "environment": "env",
-        "infrastructureDefinition": "infra",
-        "pipeline": "pipeline",
-        "inputSet": "inputs",
-    }[k]
-    body["identifier"] = to_identifier(body.get("identifier") or body.get("name") or f"{app}_{default_suffix}")
-    if k == "template":
-        body["versionLabel"] = body.get("versionLabel") or "v1"
+def write_yaml(path: str, payload: Dict[str, Any], org: str, proj: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for top in ("pipeline", "service", "template"):
+        if top in payload:
+            ensure_meta(payload, top, org, proj)
+    _walk_fix_ids_and_names(payload)
+    text = yaml.safe_dump(payload, sort_keys=False, default_flow_style=False)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    # basic re-parse sanity
+    with open(path, "r", encoding="utf-8") as f:
+        yaml.safe_load(f)
 
-def _load_one(p: Path) -> Union[List[dict], dict]:
-    text = p.read_text(encoding="utf-8")
-    if p.suffix.lower() in (".yaml", ".yml"):
-        data = yaml.safe_load(text)
-    else:
-        data = json.loads(text)
-    return data
+# ------------------ UCD helpers ------------------
+def load_ucd(path: str) -> Union[Dict[str, Any], List[Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        txt = f.read()
+    # detect by extension
+    if path.lower().endswith((".yaml", ".yml")):
+        return yaml.safe_load(txt)
+    return json.loads(txt)
 
-def _explode_known_ucd_shapes(obj: Any, verbose: bool, src: Path) -> List[dict]:
-    """
-    Convert various UCD export shapes into a list of 'units' (each roughly one application).
-    Supported patterns:
-      - {"applications":[{...},{...}]}
-      - {"Applications":[{...},{...}]}
-      - {"ucdExport":{"applications":[...]}} or similar
-      - a single entity dict with a top-level supported key (treated as one app)
-      - already a "unit-like" dict (has app/application/applicationName/name + lists)
-    """
-    units: List[dict] = []
+def _parse_tag(name: str) -> Tuple[str, str]:
+    name = (name or "").strip()
+    if ":" in name:
+        k, v = name.split(":", 1)
+        return k.strip(), v.strip()
+    return name, "true"
 
-    def _is_entity_dict(d: dict) -> bool:
-        return any(k in d for k in SUPPORTED_TOP_KEYS)
+def collect_tags_map(tag_objs: List[Dict[str, Any]]) -> Dict[str, str]:
+    tags: Dict[str, str] = {}
+    for t in tag_objs or []:
+        raw = t.get("name") if isinstance(t, dict) else str(t)
+        k, v = _parse_tag(str(raw))
+        if k:
+            tags[k] = v
+    return tags
 
-    if isinstance(obj, list):
-        # Could be already a list of units or a list of entities
-        # If items look like top-level entities, wrap as one unit named 'application'
-        if obj and all(isinstance(x, dict) and _is_entity_dict(x) for x in obj):
-            units.append({"app": "application", "entities": obj})
-            return units
-        # Otherwise treat each as a unit (best-effort)
-        for x in obj:
-            if isinstance(x, dict):
-                units.append(x)
-        return units
+def collect_tags_flat(tag_objs: List[Dict[str, Any]]) -> List[str]:
+    flat: List[str] = []
+    for t in tag_objs or []:
+        raw = t.get("name") if isinstance(t, dict) else str(t)
+        flat.append(str(raw))
+    return flat
 
-    if not isinstance(obj, dict):
-        return units
+# ------------------ template registry ------------------
+def load_registry(path: Optional[str]) -> List[Dict[str, Any]]:
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    items = data.get("templates") or []
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        m = it.get("match") or {}
+        out.append({
+            "name": it.get("name") or it.get("templateRef") or "StepGroup",
+            "templateRef": it.get("templateRef"),
+            "versionLabel": it.get("versionLabel", "v1"),
+            "match": {
+                "tags_any": m.get("tags_any") or [],
+                "tags_all": m.get("tags_all") or [],
+                "any_regex": m.get("any_regex") or [],
+                "all_regex": m.get("all_regex") or [],
+            },
+            "inputs": it.get("inputs") or {},
+        })
+    return out
 
-    # Direct applications key (lower/upper)
-    for key in ("applications", "Applications"):
-        if key in obj and isinstance(obj[key], list):
-            for app_item in obj[key]:
-                if isinstance(app_item, dict):
-                    units.append(app_item)
-            return units
-
-    # Nested export object
-    if "ucdExport" in obj and isinstance(obj["ucdExport"], dict):
-        nested = obj["ucdExport"]
-        for key in ("applications", "Applications"):
-            if key in nested and isinstance(nested[key], list):
-                for app_item in nested[key]:
-                    if isinstance(app_item, dict):
-                        units.append(app_item)
-                return units
-        # fallback: treat nested dict itself as unit
-        units.append(nested)
-        return units
-
-    # Single-entity file (e.g., only a pipeline)
-    if _is_entity_dict(obj):
-        units.append({"app": obj.get("applicationName") or obj.get("name") or "application", "entities": [obj]})
-        return units
-
-    # Default: assume already a unit-ish dict
-    units.append(obj)
-    return units
-
-def read_input_dir_or_file(path: Path, verbose: bool) -> Tuple[List[dict], List[Tuple[Path, int]]]:
-    """
-    Returns (units, per_file_counts) where per_file_counts holds (#units derived) for logging.
-    Recursively scans directories for *.json/*.yaml/*.yml.
-    """
-    if not path.exists():
-        raise FileNotFoundError(f"Input not found: {path}")
-
-    files: List[Path] = []
-    if path.is_dir():
-        files = sorted(list(path.rglob("*.json")) + list(path.rglob("*.yaml")) + list(path.rglob("*.yml")))
-        if not files:
-            raise FileNotFoundError(f"No .json/.yaml files found recursively under {path}")
-    else:
-        files = [path]
-
-    units: List[dict] = []
-    per_file_counts: List[Tuple[Path, int]] = []
-
-    for f in files:
+def _regex_any(pats: List[str], hay: str) -> bool:
+    for p in pats:
         try:
-            data = _load_one(f)
-            exploded = _explode_known_ucd_shapes(data, verbose, f)
-            units.extend(exploded)
-            per_file_counts.append((f, len(exploded)))
-        except Exception as e:
-            per_file_counts.append((f, 0))
-            if verbose:
-                print(f"[WARN] Skipped {f}: {e}", file=sys.stderr)
+            if re.search(p, hay, re.IGNORECASE):
+                return True
+        except re.error:
+            pass
+    return False
 
-    return units, per_file_counts
+def _regex_all(pats: List[str], hay: str) -> bool:
+    for p in pats:
+        try:
+            if not re.search(p, hay, re.IGNORECASE):
+                return False
+        except re.error:
+            return False
+    return True
 
-def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
-    app = (
-        ucd.get("app")
-        or ucd.get("application")
-        or ucd.get("applicationName")
-        or ucd.get("name")
-        or "application"
-    )
-    app = str(app)
+def _build_template_inputs(inputs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not inputs:
+        return None
+    vmap = inputs.get("variables") or {}
+    if not vmap:
+        return None
+    return {"variables": [{"name": str(k), "type": "String", "value": str(v)} for k, v in vmap.items()]}
 
-    # Some shapes may place raw entity dicts under 'entities'
-    entities_from_flat: List[dict] = []
-    if isinstance(ucd.get("entities"), list):
-        for e in ucd["entities"]:
-            if isinstance(e, dict) and any(k in e for k in SUPPORTED_TOP_KEYS):
-                entities_from_flat.append(e)
+def match_stepgroups_for_component(app_name: str, comp_name: str,
+                                   app_tags: List[str], comp_tags: List[str],
+                                   registry: List[Dict[str, Any]],
+                                   first_match: bool=False) -> List[Dict[str, Any]]:
+    tags_set = set([t.lower() for t in app_tags + comp_tags])
+    hay = " ".join([app_name, comp_name] + app_tags + comp_tags)
+    matched: List[Dict[str, Any]] = []
+    for rule in registry:
+        m = rule.get("match", {})
+        ok = True
+        ta = [t.lower() for t in m.get("tags_any", [])]
+        tl = [t.lower() for t in m.get("tags_all", [])]
+        if ta: ok = ok and (len(tags_set.intersection(ta)) > 0)
+        if ok and tl: ok = ok and all(t in tags_set for t in tl)
+        if ok and m.get("any_regex"): ok = ok and _regex_any(m["any_regex"], hay)
+        if ok and m.get("all_regex"): ok = ok and _regex_all(m["all_regex"], hay)
+        if ok:
+            spec = {"name": rule["name"], "templateRef": rule["templateRef"], "versionLabel": rule["versionLabel"]}
+            ti = _build_template_inputs(rule.get("inputs") or {})
+            if ti:
+                spec["templateInputs"] = ti
+            matched.append(spec)
+            if first_match:
+                break
+    return matched
 
-    def wrap_list(key: str, items: List[dict], default_builder) -> List[dict]:
-        out = []
-        for it in items or []:
-            if key in it:
-                out.append(it)
-            else:
-                out.append(default_builder(it))
-        return out
-
-    # Prefer explicit lists if present, otherwise mine from flat entities
-    raw_tmpls = ucd.get("templates", [])
-    raw_svcs = ucd.get("services", [])
-    raw_envs = ucd.get("environments", [])
-    raw_infras = ucd.get("infrastructures", [])
-    raw_pipes = ucd.get("pipelines", [])
-    raw_inputs = ucd.get("input_sets", []) or ucd.get("inputSets", [])
-
-    # Sweep flat entities into respective buckets if not already populated
-    if entities_from_flat:
-        for ent in entities_from_flat:
-            for k in SUPPORTED_TOP_KEYS:
-                if k in ent:
-                    if k == "template":
-                        raw_tmpls.append(ent); break
-                    if k == "service":
-                        raw_svcs.append(ent); break
-                    if k == "environment":
-                        raw_envs.append(ent); break
-                    if k == "infrastructureDefinition":
-                        raw_infras.append(ent); break
-                    if k == "pipeline":
-                        raw_pipes.append(ent); break
-                    if k == "inputSet":
-                        raw_inputs.append(ent); break
-
-    templates = wrap_list(
-        "template",
-        raw_tmpls,
-        lambda t: {
-            "template": {
-                "name": t.get("name", "Template"),
-                "identifier": t.get("identifier") or to_identifier(t.get("name", "Template")),
-                "versionLabel": t.get("versionLabel", "v1"),
-                "type": t.get("type", "Step"),
-                "spec": t.get("spec", {}),
-            }
-        },
-    )
-
-    services = wrap_list(
-        "service",
-        raw_svcs,
-        lambda s: {
-            "service": {
-                "name": s.get("name", f"{app}-service"),
-                "identifier": s.get("identifier") or f"{to_identifier(app)}_service",
-                "orgIdentifier": s.get("orgIdentifier", org),
-                "projectIdentifier": s.get("projectIdentifier", project),
-                "serviceDefinition": s.get("serviceDefinition", {"type": "CustomDeployment", "spec": {}}),
-            }
-        },
-    )
-
-    environments = wrap_list(
-        "environment",
-        raw_envs,
-        lambda e: {
-            "environment": {
-                "name": e.get("name", f"{app}-env"),
-                "identifier": e.get("identifier") or f"{to_identifier(app)}_env",
-                "type": e.get("type", "PreProduction"),
-                "orgIdentifier": e.get("orgIdentifier", org),
-                "projectIdentifier": e.get("projectIdentifier", project),
-            }
-        },
-    )
-
-    infrastructures = wrap_list(
-        "infrastructureDefinition",
-        raw_infras,
-        lambda i: {
-            "infrastructureDefinition": {
-                "name": i.get("name", f"{app}-infra"),
-                "identifier": i.get("identifier") or f"{to_identifier(app)}_infra",
-                "orgIdentifier": i.get("orgIdentifier", org),
-                "projectIdentifier": i.get("projectIdentifier", project),
-                "environmentRef": i.get("environmentRef") or f"{to_identifier(app)}_env",
-                "type": i.get("type", "CustomDeployment"),
-                "spec": i.get("spec", {"connectorRef": "<+input>", "namespace": "<+input>"}),
-            }
-        },
-    )
-
-    pipelines = wrap_list(
-        "pipeline",
-        raw_pipes,
-        lambda p: {
-            "pipeline": {
-                "name": p.get("name", f"{app} deploy"),
-                "identifier": p.get("identifier") or f"{to_identifier(app)}_deploy",
-                "orgIdentifier": p.get("orgIdentifier", org),
-                "projectIdentifier": p.get("projectIdentifier", project),
-                "tags": p.get("tags", {}),
-                "stages": p.get("stages", []),
-            }
-        },
-    )
-
-    input_sets = wrap_list(
-        "inputSet",
-        raw_inputs,
-        lambda i: {
-            "inputSet": {
-                "name": i.get("name", f"{app} Inputs"),
-                "identifier": i.get("identifier") or f"{to_identifier(app)}_inputs",
-                "orgIdentifier": i.get("orgIdentifier", org),
-                "projectIdentifier": i.get("projectIdentifier", project),
-                "pipeline": {"identifier": i.get("pipelineIdentifier") or f"{to_identifier(app)}_deploy"},
-                "pipelineInputs": i.get("pipelineInputs", {}),
-            }
-        },
-    )
-
-    # Normalize & inject org/project
-    all_lists = [templates, services, environments, infrastructures, pipelines, input_sets]
-    for lst in all_lists:
-        for entity in lst:
-            normalize_identifiers(entity, app)
-            ensure_org_project(entity, org, project)
-
+# ------------------ builders ------------------
+def build_service_payload(name: str, identifier: str, tags_map: Dict[str, str]) -> Dict[str, Any]:
     return {
-        "app": app,
-        "templates": templates,
-        "services": services,
-        "environments": environments,
-        "infrastructures": infrastructures,
-        "pipelines": pipelines,
-        "input_sets": input_sets,
+        "service": {
+            "name": sanitize_name(name),
+            "identifier": sanitize_identifier(identifier),
+            "tags": tags_map or {},
+            "serviceDefinition": {
+                "type": "CustomDeployment",
+                "spec": {
+                    "variables": []
+                }
+            }
+        }
     }
 
-def convert_all(ucd_units: Iterable[dict], writer: Writer, org: str, project: str) -> List[Tuple[str, Path]]:
-    results: List[Tuple[str, Path]] = []
-    for unit in ucd_units:
-        mapped = map_ucd_unit(unit, org, project)
-        app = mapped["app"]
+def _fetch_instance_step() -> Dict[str, Any]:
+    return {
+        "step": {
+            "name": "Fetch Instances",
+            "identifier": "Fetch_Instances",
+            "type": "FetchInstanceScript",
+            "timeout": "10m",
+            "spec": {
+                "shell": "Bash",
+                "onDelegate": True,
+                "source": {
+                    "type": "Inline",
+                    "spec": {
+                        "script": (
+                            'echo "Fetching instances for $HARNESS_SERVICE_NAME..."\n'
+                            'echo \'{"instances":[{"name":"sample-instance","id":"1"}]}\'\n'
+                        )
+                    }
+                }
+            }
+        }
+    }
 
-        for tpl in mapped["templates"]:
-            p = writer.write_template(tpl)
-            if p:
-                results.append(("template", p))
-        for svc in mapped["services"]:
-            results.append(("service", writer.write_service(app, svc)))
-        for env in mapped["environments"]:
-            results.append(("environment", writer.write_environment(app, env)))
-        for infra in mapped["infrastructures"]:
-            results.append(("infrastructure", writer.write_infrastructure(app, infra)))
-        for pipe in mapped["pipelines"]:
-            results.append(("pipeline", writer.write_pipeline(app, pipe)))
-        for ins in mapped["input_sets"]:
-            results.append(("input_set", writer.write_input_set(app, ins)))
+def build_stage_for_component(svc_identifier: str,
+                              stage_name: str,
+                              matched_stepgroups: List[Dict[str, Any]]) -> Dict[str, Any]:
+    disp = sanitize_name(stage_name)
+    ident = sanitize_identifier(disp)
+    stage = {
+        "stage": {
+            "name": disp,
+            "identifier": ident,
+            "type": "Deployment",
+            "spec": {
+                "deploymentType": "CustomDeployment",
+                "service": {"serviceRef": svc_identifier},
+                "environment": {
+                    "environmentRef": "<+input>",
+                    "deployToAll": True,
+                    "infrastructureDefinitions": [{"identifier": "input"}]
+                },
+                "execution": {"steps": []}
+            },
+            "failureStrategies": [
+                {
+                    "onFailure": {
+                        "errors": ["AllErrors"],
+                        "action": {"type": "StageRollback"}
+                    }
+                }
+            ]
+        }
+    }
+    steps = stage["stage"]["spec"]["execution"]["steps"]
+    # 1) Fetch first
+    steps.append(_fetch_instance_step())
+    # 2) Matched StepGroups
+    for sg in matched_stepgroups or []:
+        sg_name = sanitize_name(sg["name"])
+        block: Dict[str, Any] = {
+            "stepGroup": {
+                "name": sg_name,
+                "identifier": sanitize_identifier(sg_name),
+                "template": {
+                    "templateRef": sg["templateRef"],
+                    "versionLabel": sg.get("versionLabel", "v1")
+                }
+            }
+        }
+        if "templateInputs" in sg:
+            block["stepGroup"]["template"]["templateInputs"] = sg["templateInputs"]
+        steps.append(block)
+    # 3) Terminal placeholder
+    steps.append({
+        "step": {
+            "name": "Deploy",
+            "identifier": "Deploy",
+            "type": "ShellScript",
+            "spec": {
+                "shell": "Bash",
+                "onDelegate": True,
+                "source": {"type": "Inline", "spec": {"script": "echo TODO: implement deployment"}}
+            }
+        }
+    })
+    # enforce single Fetch first
+    def _is_fetch(n: Dict[str, Any]) -> bool:
+        return "step" in n and n["step"].get("type") == "FetchInstanceScript"
+    rest = [_ for _ in steps if not _is_fetch(_)]
+    steps.clear()
+    steps.append(_fetch_instance_step())
+    steps.extend(rest)
+    return stage
 
-    return results
+def build_pipeline_payload(pipeline_name: str,
+                           pipeline_id: str,
+                           org: str, proj: str,
+                           stages: List[Dict[str, Any]],
+                           pipeline_tags: Optional[Dict[str, str]]=None) -> Dict[str, Any]:
+    return {
+        "pipeline": {
+            "name": sanitize_name(pipeline_name),
+            "identifier": sanitize_identifier(pipeline_id),
+            "orgIdentifier": org,
+            "projectIdentifier": proj,
+            "tags": pipeline_tags or {},
+            "stages": stages
+        }
+    }
 
-def main(argv: List[str]) -> None:
-    ap = argparse.ArgumentParser(description="UCD → Harness YAML converter (import-ready; recursive input scanning)")
-    ap.add_argument("--input-dir", required=True, help="Directory or file containing UCD JSON/YAML (scanned recursively for dirs)")
-    ap.add_argument("--out", required=True, help="Output root (e.g., harness_out)")
-    ap.add_argument("--org", default="default", help="Harness orgIdentifier (default: default)")
-    ap.add_argument("--project", default="ucd2harnessmigration", help="Harness projectIdentifier (default: ucd2harnessmigration)")
-    ap.add_argument("--group-by", default="application", help="Grouping mode (currently informational; default: application)")
-    ap.add_argument("--verbose", action="store_true", help="Print per-file diagnostics")
-    args = ap.parse_args(argv[1:])
+# ------------------ write ONE _common templates & ONE registry ------------------
+def write_global_common_templates(out_root: str, org: str, proj: str) -> str:
+    """
+    Creates once:
+      <out_root>/_common/.harness/templates/step-groups/<*.yaml>
+      <out_root>/.harness/template-registry.yaml
+    Returns the path to the registry.
+    """
+    common_dir = os.path.join(out_root, "_common", ".harness", "templates", "step-groups")
+    os.makedirs(common_dir, exist_ok=True)
 
-    input_path = Path(args.input_dir)
-    out_root = Path(args.out)
-    out_root.mkdir(parents=True, exist_ok=True)
+    def _tmpl(name: str, identifier: str, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "template": {
+                "name": sanitize_name(name),
+                "identifier": sanitize_identifier(identifier),
+                "versionLabel": "v1",
+                "type": "StepGroup",
+                "orgIdentifier": org,
+                "projectIdentifier": proj,
+                "spec": {
+                    "stageType": "CustomDeployment",
+                    "steps": steps
+                }
+            }
+        }
 
-    ucd_units, per_file_counts = read_input_dir_or_file(input_path, args.verbose)
-    if args.verbose:
-        for f, n in per_file_counts:
-            print(f"[scan] {f} -> {n} unit(s)")
+    # example stepgroup content (extend/modify as needed)
+    run_gradle = {"step": {"type": "Run","name":"Gradle Build","identifier":"Gradle_Build",
+                           "spec":{"shell":"Bash","command":"gradle clean build"}}}
+    pub_art   = {"step": {"type": "Run","name":"Publish Artifact","identifier":"Publish_Artifact",
+                           "spec":{"shell":"Bash","command":"echo publish artifact placeholder"}}}
+    py_setup  = {"step": {"type": "Run","name":"Python Setup","identifier":"Python_Setup",
+                           "spec":{"shell":"Bash","command":"python --version && pip --version || true"}}}
+    dotnet_b  = {"step": {"type": "Run","name":".NET Build","identifier":"DotNet_Build",
+                           "spec":{"shell":"Bash","command":"dotnet --info && echo dotnet build placeholder"}}}
+    iis_wd    = {"step": {"type": "Run","name":"IIS Web Deploy","identifier":"IIS_Web_Deploy",
+                           "spec":{"shell":"Bash","command":"echo msdeploy placeholder"}}}
+    win_svc   = {"step": {"type": "Run","name":"Windows Service Control","identifier":"Windows_Service_Control",
+                           "spec":{"shell":"Bash","command":"echo win service control placeholder"}}}
+    msi_ins   = {"step": {"type": "Run","name":"MSI Install","identifier":"MSI_Install",
+                           "spec":{"shell":"Bash","command":"echo msi install placeholder"}}}
 
-    writer = Writer(out_root)
-    results = convert_all(ucd_units, writer, args.org, args.project)
+    templates = [
+        ("Java Gradle Build", "Java_Gradle_Build", [run_gradle, pub_art]),
+        ("Python App Deploy", "Python_App_Deploy", [py_setup]),
+        (".NET Build & Publish", "DotNet_Build_Publish", [dotnet_b, pub_art]),
+        ("IIS MS Web Deploy", "IIS_MS_Web_Deploy", [iis_wd]),
+        ("Windows Service Control", "Windows_Service", [win_svc]),
+        ("Windows MSI Deploy", "MSI_Deploy", [msi_ins]),
+    ]
+    for name, ident, steps in templates:
+        path = os.path.join(common_dir, f"{sanitize_identifier(ident)}.yaml")
+        write_yaml(path, _tmpl(name, ident, steps), org, proj)
 
-    counts: Dict[str, int] = {}
-    for kind, _ in results:
-        counts[kind] = counts.get(kind, 0) + 1
+    # global registry
+    reg_dir = os.path.join(out_root, ".harness")
+    os.makedirs(reg_dir, exist_ok=True)
+    registry = {
+        "templates": [
+            {
+                "name": "Java Gradle Build",
+                "templateRef": "Java_Gradle_Build",
+                "versionLabel": "v1",
+                "type": "StepGroup",
+                "match": { "tags_any": ["language:java","build:gradle"],
+                           "any_regex": [r"\\bgradle\\b", r"\\.jar\\b", r"\\.war\\b"] }
+            },
+            {
+                "name": "Python App Deploy",
+                "templateRef": "Python_App_Deploy",
+                "versionLabel": "v1",
+                "type": "StepGroup",
+                "match": { "tags_any": ["language:python","python:venv"],
+                           "any_regex": [r"\\bpython\\b","flask","django"] }
+            },
+            {
+                "name": ".NET Build & Publish",
+                "templateRef": "DotNet_Build_Publish",
+                "versionLabel": "v1",
+                "type": "StepGroup",
+                "match": { "tags_any": ["runtime:dotnet","dotnet"],
+                           "any_regex": [r"\\.csproj\\b", r"\\.sln\\b", r"\\bdotnet\\b"] }
+            },
+            {
+                "name": "IIS MS Web Deploy",
+                "templateRef": "IIS_MS_Web_Deploy",
+                "versionLabel": "v1",
+                "type": "StepGroup",
+                "match": { "tags_any": ["deploy:iis","IIS","IIS_MS_Web_Deploy","Windows Web-Content"] }
+            },
+            {
+                "name": "Windows Service Control",
+                "templateRef": "Windows_Service",
+                "versionLabel": "v1",
+                "type": "StepGroup",
+                "match": { "tags_any": ["Windows_Service"] }
+            },
+            {
+                "name": "Windows MSI Deploy",
+                "templateRef": "MSI_Deploy",
+                "versionLabel": "v1",
+                "type": "StepGroup",
+                "match": { "tags_any": ["MSI_Deploy"] }
+            }
+        ]
+    }
+    reg_path = os.path.join(reg_dir, "template-registry.yaml")
+    with open(reg_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(registry, f, sort_keys=False, default_flow_style=False)
+    return reg_path
 
-    total = len(results)
-    print(f"[OK] Wrote {total} YAMLs to {out_root.resolve()}")
-    if counts:
-        print("Counts:", ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
-    if total == 0:
-        print(
-            "[HINT] No entities were emitted.\n"
-            "  • Ensure your files contain at least one of: template/service/environment/infrastructureDefinition/pipeline/inputSet\n"
-            "  • If your export is nested (e.g., {'ucdExport': {'applications': [...]}}), this script now handles it.\n"
-            "  • Use --verbose to see how each file was interpreted.\n"
-            "  • Verify --input-dir points to the folder/files with UCD exports (this script scans recursively).",
-            file=sys.stderr,
-        )
+# ------------------ input collection & grouping ------------------
+def collect_input_files(inputs: List[str], input_dir: Optional[str], recursive: bool) -> List[str]:
+    files: List[str] = []
+
+    def _expand_dir(d: str) -> None:
+        pat_json = os.path.join(d, "**", "*.json") if recursive else os.path.join(d, "*.json")
+        pat_yaml = os.path.join(d, "**", "*.y*ml") if recursive else os.path.join(d, "*.y*ml")
+        files.extend(glob.glob(pat_json, recursive=recursive))
+        files.extend(glob.glob(pat_yaml, recursive=recursive))
+
+    # explicit --input
+    for item in inputs or []:
+        for part in [p.strip() for p in item.split(",") if p.strip()]:
+            if os.path.isdir(part):
+                _expand_dir(part)
+            else:
+                files.append(part)
+
+    # --input-dir
+    if input_dir:
+        if os.path.isdir(input_dir):
+            _expand_dir(input_dir)
+        else:
+            files.append(input_dir)
+
+    # normalize / dedupe
+    normed, seen = [], set()
+    for f in files:
+        p = os.path.abspath(f)
+        if os.path.isfile(p) and (p.endswith(".json") or p.lower().endswith((".yaml", ".yml"))) and p not in seen:
+            seen.add(p); normed.append(p)
+    return normed
+
+def base_out_root_for(args, file_path: Optional[str]=None, app_name: Optional[str]=None) -> str:
+    if args.group_by == "none":
+        return os.path.abspath(args.out)
+    if args.group_by == "file":
+        if not file_path:
+            raise ValueError("group-by=file requires file_path")
+        base = os.path.splitext(os.path.basename(file_path))[0]
+        return os.path.join(os.path.abspath(args.out), sanitize_identifier(base))
+    if args.group_by == "application":
+        if not app_name:
+            raise ValueError("group-by=application requires app_name")
+        return os.path.join(os.path.abspath(args.out), sanitize_identifier(app_name))
+    return os.path.abspath(args.out)
+
+def ensure_harness_dirs(base_root: str) -> Tuple[str, str]:
+    out_root = os.path.join(base_root, ".harness")
+    services_dir = os.path.join(out_root, "services")
+    pipelines_dir = os.path.join(out_root, "pipelines")
+    os.makedirs(services_dir, exist_ok=True)
+    os.makedirs(pipelines_dir, exist_ok=True)
+    return services_dir, pipelines_dir
+
+# ------------------ UCD shape extraction ------------------
+def extract_applications(ucd_obj: Union[Dict[str, Any], List[Any]]) -> List[Dict[str, Any]]:
+    """
+    Supports:
+      {"applications":[...]}
+      {"Applications":[...]}
+      {"ucdExport":{"applications":[...]}}
+      a list of application dicts already
+    """
+    if isinstance(ucd_obj, list):
+        return [x for x in ucd_obj if isinstance(x, dict)]
+    if not isinstance(ucd_obj, dict):
+        return []
+
+    # direct
+    if "applications" in ucd_obj and isinstance(ucd_obj["applications"], list):
+        return [x for x in ucd_obj["applications"] if isinstance(x, dict)]
+    if "Applications" in ucd_obj and isinstance(ucd_obj["Applications"], list):
+        return [x for x in ucd_obj["Applications"] if isinstance(x, dict)]
+
+    # nested
+    if "ucdExport" in ucd_obj and isinstance(ucd_obj["ucdExport"], dict):
+        exp = ucd_obj["ucdExport"]
+        if "applications" in exp and isinstance(exp["applications"], list):
+            return [x for x in exp["applications"] if isinstance(x, dict)]
+        if "Applications" in exp and isinstance(exp["Applications"], list):
+            return [x for x in exp["Applications"] if isinstance(x, dict)]
+
+    # fallback: if this dict itself looks like an application
+    if "application" in ucd_obj or "components" in ucd_obj:
+        return [ucd_obj]
+
+    return []
+
+# ------------------ main ------------------
+def main() -> None:
+    p = argparse.ArgumentParser(description="Convert UCD export JSON/YAML to Harness YAML (global _common templates pack)")
+    p.add_argument("--input", action="append", help="Path(s) to UCD files. Repeat flag or comma-separated. May include directories.")
+    p.add_argument("--input-dir", help="Directory containing UCD files")
+    p.add_argument("--recursive", action="store_true", help="Recurse into subfolders when scanning directories")
+    p.add_argument("--out", required=True, help="Output base folder (parent of .harness)")
+    p.add_argument("--org", required=True, help="Harness orgIdentifier")
+    p.add_argument("--project", required=True, help="Harness projectIdentifier")
+    p.add_argument("--first-match", action="store_true", help="Stop after first matching template per component")
+    p.add_argument("--group-by", choices=["file","application","none"], default="application",
+                   help="How to organize outputs under --out (default: application)")
+    p.add_argument("--verbose", action="store_true", help="Print per-file diagnostics")
+    args = p.parse_args()
+
+    files = collect_input_files(args.input or [], args.input_dir, args.recursive)
+    if not files:
+        print("ERROR: No input files found (json/yaml)."); sys.exit(2)
+
+    out_root = os.path.abspath(args.out)
+    # Seed ONE global _common pack + registry (idempotent)
+    reg_path = os.path.join(out_root, ".harness", "template-registry.yaml")
+    if not os.path.exists(reg_path):
+        write_global_common_templates(out_root, args.org, args.project)
+    registry = load_registry(reg_path)
+
+    grand_apps = grand_svcs = 0
+
+    for idx, path in enumerate(files, 1):
+        if args.verbose:
+            print(f"\n[{idx}/{len(files)}] Processing: {path}")
+        try:
+            ucd_obj = load_ucd(path)
+        except Exception as e:
+            print(f"  Skipping (bad file): {e}")
+            continue
+
+        apps = extract_applications(ucd_obj)
+        if not apps:
+            if args.verbose:
+                print("  [warn] No applications found in this file.")
+            continue
+
+        file_apps = file_svcs = 0
+
+        for app in apps:
+            app_meta = app.get("application") or {}
+            app_name = app_meta.get("name") or app.get("applicationName") or app.get("name") or "Application"
+            app_tags_flat = collect_tags_flat(app_meta.get("tags") or [])
+            app_tags_map  = collect_tags_map(app_meta.get("tags") or [])
+
+            # decide group folder for outputs
+            if args.group_by == "application":
+                group_root = base_out_root_for(args, app_name=app_name)
+            elif args.group_by == "file":
+                group_root = base_out_root_for(args, file_path=path)
+            else:
+                group_root = base_out_root_for(args)
+
+            services_dir, pipelines_dir = ensure_harness_dirs(group_root)
+
+            stages: List[Dict[str, Any]] = []
+            svc_count = 0
+
+            comps = app.get("components") or []
+            if not comps and args.verbose:
+                print(f"  [warn] Application '{app_name}' has no components; pipeline will have no stages.")
+
+            for comp in comps:
+                comp_name = comp.get("name") or "Component"
+                comp_tags_flat = collect_tags_flat(comp.get("tags") or [])
+                comp_tags_map  = collect_tags_map(comp.get("tags") or [])
+
+                svc_identifier = sanitize_identifier(f"{app_name}_{comp_name}")
+
+                # service
+                svc_yaml = build_service_payload(comp_name, svc_identifier, {**app_tags_map, **comp_tags_map})
+                svc_path = os.path.join(services_dir, f"{svc_identifier}.yaml")
+                write_yaml(svc_path, svc_yaml, args.org, args.project)
+                svc_count += 1; file_svcs += 1
+
+                # stage (Fetch first + matched stepgroups + Deploy placeholder)
+                matched = match_stepgroups_for_component(app_name, comp_name, app_tags_flat, comp_tags_flat, registry, first_match=args.first_match)
+                stage_name = f"Deploy {comp_name}"
+                stage = build_stage_for_component(svc_identifier, stage_name, matched)
+                stages.append(stage)
+
+            # pipeline (even with 0 stages it's a valid shell you can edit later)
+            pipeline_name = f"{app_name} deploy"
+            pipeline_id   = f"{app_name}_deploy"
+            pipeline_yaml = build_pipeline_payload(pipeline_name, pipeline_id, args.org, args.project, stages, app_tags_map)
+            pipe_path = os.path.join(pipelines_dir, f"{sanitize_identifier(pipeline_id)}.yaml")
+            write_yaml(pipe_path, pipeline_yaml, args.org, args.project)
+
+            file_apps += 1
+            if args.verbose:
+                print(f"  Converted application: {app_name}  ->  {svc_count} service(s), 1 pipeline")
+
+        grand_apps += file_apps
+        grand_svcs += file_svcs
+        if args.verbose:
+            print(f"  File summary: {file_apps} application(s), {file_svcs} service(s)")
+
+    print(f"\nAll done. Processed {len(files)} file(s), {grand_apps} application(s), {grand_svcs} service(s).")
+    print(f"Output root: {out_root}  (group-by: {args.group_by})")
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()
