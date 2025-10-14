@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-UCD → Harness NG converter (with _common templates pack)
+UCD → Harness NG converter (single global _common templates pack)
 
-What’s new
-----------
-- Emits a reusable templates bundle in: <OUT>/<GROUP>/_common/.harness/templates/step-groups/*.yaml
-- Auto-writes a .harness/template-registry.yaml (if not present) that matches UCD tags to those templates
-- Services still use serviceDefinition.type: CustomDeployment (no customDeploymentRef)
-- Pipelines still inject exactly one FetchInstanceScript, then matched StepGroups, then a Deploy placeholder
+- Creates ONE shared templates pack at: <OUT>/_common/.harness/templates/step-groups/*.yaml
+- Creates ONE shared registry at:      <OUT>/.harness/template-registry.yaml
+- Generates per-group (application/file) Services and Pipelines that reference those shared templates
+- Injects exactly one FetchInstanceScript as the first step in every CustomDeployment stage
+- Service YAML uses: serviceDefinition.type: CustomDeployment (no customDeploymentRef)
 
 Run
 ---
@@ -97,6 +96,7 @@ def write_yaml(path: str, payload: Dict[str, Any], org: str, proj: str) -> None:
     text = yaml.safe_dump(payload, sort_keys=False, default_flow_style=False)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+    # basic re-parse sanity
     with open(path, "r", encoding="utf-8") as f:
         yaml.safe_load(f)
 
@@ -247,7 +247,6 @@ def _fetch_instance_step() -> Dict[str, Any]:
 
 def build_stage_for_component(svc_identifier: str,
                               stage_name: str,
-                              _deployment_type: str,
                               matched_stepgroups: List[Dict[str, Any]]) -> Dict[str, Any]:
     disp = sanitize_name(stage_name)
     ident = sanitize_identifier(disp)
@@ -333,16 +332,16 @@ def build_pipeline_payload(pipeline_name: str,
         }
     }
 
-# ------------------ write _common templates & registry ------------------
-def write_common_templates_pack(group_root: str, org: str, proj: str) -> str:
+# ------------------ write ONE _common templates & ONE registry ------------------
+def write_global_common_templates(out_root: str, org: str, proj: str) -> str:
     """
-    Creates:
-      <group_root>/_common/.harness/templates/step-groups/<*.yaml>
-    Returns the absolute path of the auto-generated registry file at:
-      <group_root>/.harness/template-registry.yaml
+    Creates once:
+      <out_root>/_common/.harness/templates/step-groups/<*.yaml>
+      <out_root>/.harness/template-registry.yaml
+    Returns the path to the registry.
     """
-    common_root = os.path.join(group_root, "_common", ".harness", "templates", "step-groups")
-    os.makedirs(common_root, exist_ok=True)
+    common_dir = os.path.join(out_root, "_common", ".harness", "templates", "step-groups")
+    os.makedirs(common_dir, exist_ok=True)
 
     def _tmpl(name: str, identifier: str, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {
@@ -360,44 +359,37 @@ def write_common_templates_pack(group_root: str, org: str, proj: str) -> str:
             }
         }
 
-    # Step definitions (simple, safe placeholders)
-    run_gradle = {
-        "step": {
-            "type": "Run",
-            "name": "Gradle Build",
-            "identifier": "Gradle_Build",
-            "spec": {"shell": "Bash", "command": "gradle clean build"}
-        }
-    }
-    pub_art = {"step": {"type": "Run", "name": "Publish Artifact", "identifier": "Publish_Artifact",
-                        "spec": {"shell": "Bash", "command": "echo publish artifact placeholder"}}}
-    py_setup = {"step": {"type": "Run", "name": "Python Setup", "identifier": "Python_Setup",
-                         "spec": {"shell": "Bash", "command": "python --version && pip --version || true"}}}
-    dotnet_build = {"step": {"type": "Run", "name": ".NET Build", "identifier": "DotNet_Build",
-                             "spec": {"shell": "Bash", "command": "dotnet --info && echo dotnet build placeholder"}}}
-    iis_webdeploy = {"step": {"type": "Run", "name": "IIS Web Deploy", "identifier": "IIS_Web_Deploy",
-                              "spec": {"shell": "Bash", "command": "echo msdeploy placeholder"}}}
-    win_service = {"step": {"type": "Run", "name": "Windows Service Control", "identifier": "Windows_Service_Control",
-                            "spec": {"shell": "Bash", "command": "echo win service control placeholder"}}}
-    msi_install = {"step": {"type": "Run", "name": "MSI Install", "identifier": "MSI_Install",
-                            "spec": {"shell": "Bash", "command": "echo msi install placeholder"}}}
+    # simple step definitions
+    run_gradle = {"step": {"type": "Run","name":"Gradle Build","identifier":"Gradle_Build",
+                           "spec":{"shell":"Bash","command":"gradle clean build"}}}
+    pub_art   = {"step": {"type": "Run","name":"Publish Artifact","identifier":"Publish_Artifact",
+                           "spec":{"shell":"Bash","command":"echo publish artifact placeholder"}}}
+    py_setup  = {"step": {"type": "Run","name":"Python Setup","identifier":"Python_Setup",
+                           "spec":{"shell":"Bash","command":"python --version && pip --version || true"}}}
+    dotnet_b  = {"step": {"type": "Run","name":".NET Build","identifier":"DotNet_Build",
+                           "spec":{"shell":"Bash","command":"dotnet --info && echo dotnet build placeholder"}}}
+    iis_wd    = {"step": {"type": "Run","name":"IIS Web Deploy","identifier":"IIS_Web_Deploy",
+                           "spec":{"shell":"Bash","command":"echo msdeploy placeholder"}}}
+    win_svc   = {"step": {"type": "Run","name":"Windows Service Control","identifier":"Windows_Service_Control",
+                           "spec":{"shell":"Bash","command":"echo win service control placeholder"}}}
+    msi_ins   = {"step": {"type": "Run","name":"MSI Install","identifier":"MSI_Install",
+                           "spec":{"shell":"Bash","command":"echo msi install placeholder"}}}
 
     templates = [
         ("Java Gradle Build", "Java_Gradle_Build", [run_gradle, pub_art]),
         ("Python App Deploy", "Python_App_Deploy", [py_setup]),
-        (".NET Build & Publish", "DotNet_Build_Publish", [dotnet_build, pub_art]),
-        ("IIS MS Web Deploy", "IIS_MS_Web_Deploy", [iis_webdeploy]),
-        ("Windows Service Control", "Windows_Service", [win_service]),
-        ("Windows MSI Deploy", "MSI_Deploy", [msi_install]),
+        (".NET Build & Publish", "DotNet_Build_Publish", [dotnet_b, pub_art]),
+        ("IIS MS Web Deploy", "IIS_MS_Web_Deploy", [iis_wd]),
+        ("Windows Service Control", "Windows_Service", [win_svc]),
+        ("Windows MSI Deploy", "MSI_Deploy", [msi_ins]),
     ]
-
     for name, ident, steps in templates:
-        path = os.path.join(common_root, f"{sanitize_identifier(ident)}.yaml")
+        path = os.path.join(common_dir, f"{sanitize_identifier(ident)}.yaml")
         write_yaml(path, _tmpl(name, ident, steps), org, proj)
 
-    # Write a registry alongside group root: <group_root>/.harness/template-registry.yaml
-    registry_out_dir = os.path.join(group_root, ".harness")
-    os.makedirs(registry_out_dir, exist_ok=True)
+    # global registry
+    reg_dir = os.path.join(out_root, ".harness")
+    os.makedirs(reg_dir, exist_ok=True)
     registry = {
         "templates": [
             {
@@ -405,39 +397,31 @@ def write_common_templates_pack(group_root: str, org: str, proj: str) -> str:
                 "templateRef": "Java_Gradle_Build",
                 "versionLabel": "v1",
                 "type": "StepGroup",
-                "match": {
-                    "tags_any": ["language:java","build:gradle"],
-                    "any_regex": [r"\bgradle\b", r"\.jar\b", r"\.war\b"]
-                }
+                "match": { "tags_any": ["language:java","build:gradle"],
+                           "any_regex": [r"\bgradle\b", r"\.jar\b", r"\.war\b"] }
             },
             {
                 "name": "Python App Deploy",
                 "templateRef": "Python_App_Deploy",
                 "versionLabel": "v1",
                 "type": "StepGroup",
-                "match": {
-                    "tags_any": ["language:python","python:venv"],
-                    "any_regex": [r"\bpython\b","flask","django"]
-                }
+                "match": { "tags_any": ["language:python","python:venv"],
+                           "any_regex": [r"\bpython\b","flask","django"] }
             },
             {
                 "name": ".NET Build & Publish",
                 "templateRef": "DotNet_Build_Publish",
                 "versionLabel": "v1",
                 "type": "StepGroup",
-                "match": {
-                    "tags_any": ["runtime:dotnet","dotnet"],
-                    "any_regex": [r"\.csproj\b", r"\.sln\b", r"\bdotnet\b"]
-                }
+                "match": { "tags_any": ["runtime:dotnet","dotnet"],
+                           "any_regex": [r"\.csproj\b", r"\.sln\b", r"\bdotnet\b"] }
             },
             {
                 "name": "IIS MS Web Deploy",
                 "templateRef": "IIS_MS_Web_Deploy",
                 "versionLabel": "v1",
                 "type": "StepGroup",
-                "match": {
-                    "tags_any": ["deploy:iis","IIS","IIS_MS_Web_Deploy","Windows Web-Content"]
-                }
+                "match": { "tags_any": ["deploy:iis","IIS","IIS_MS_Web_Deploy","Windows Web-Content"] }
             },
             {
                 "name": "Windows Service Control",
@@ -455,7 +439,7 @@ def write_common_templates_pack(group_root: str, org: str, proj: str) -> str:
             }
         ]
     }
-    reg_path = os.path.join(registry_out_dir, "template-registry.yaml")
+    reg_path = os.path.join(reg_dir, "template-registry.yaml")
     with open(reg_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(registry, f, sort_keys=False, default_flow_style=False)
     return reg_path
@@ -504,7 +488,7 @@ def ensure_harness_dirs(base_root: str) -> Tuple[str, str]:
 
 # ------------------ main ------------------
 def main() -> None:
-    p = argparse.ArgumentParser(description="Convert UCD export JSON to Harness YAML (with _common templates pack)")
+    p = argparse.ArgumentParser(description="Convert UCD export JSON to Harness YAML (global _common templates pack)")
     p.add_argument("--input", action="append", help="Path(s) to UCD JSON. Repeat flag or comma-separated. May include directories.")
     p.add_argument("--input-dir", help="Directory containing UCD JSON files")
     p.add_argument("--glob", default="*.json", help="Glob for --input-dir (default: *.json)")
@@ -521,6 +505,14 @@ def main() -> None:
     if not files:
         print("ERROR: No input files found."); sys.exit(2)
 
+    out_root = os.path.abspath(args.out)
+    # Seed ONE global _common pack + registry (idempotent)
+    reg_path = os.path.join(out_root, ".harness", "template-registry.yaml")
+    if not os.path.exists(reg_path):
+        write_global_common_templates(out_root, args.org, args.project)
+    # load registry once
+    registry = load_registry(reg_path)
+
     grand_apps = grand_svcs = 0
 
     for idx, path in enumerate(files, 1):
@@ -533,46 +525,21 @@ def main() -> None:
 
         file_apps = file_svcs = 0
 
-        # For group-by=file we create/seed templates once per file root
-        # For group-by=application we’ll seed per application root
-        file_base_root = None
-        if args.group_by == "file":
-            file_base_root = base_out_root_for(args, file_path=path)
-            # auto-create the _common templates and registry if missing
-            reg_path = os.path.join(file_base_root, ".harness", "template-registry.yaml")
-            if not os.path.exists(reg_path):
-                write_common_templates_pack(file_base_root, args.org, args.project)
-            with open(reg_path, "r", encoding="utf-8") as f:
-                registry = load_registry(reg_path)
-        else:
-            registry = []  # will be (re)loaded per application root below
-
         for app in (ucd.get("applications") or []):
             app_meta = app.get("application") or {}
             app_name = app_meta.get("name") or "Application"
             app_tags_flat = collect_tags_flat(app_meta.get("tags") or [])
             app_tags_map  = collect_tags_map(app_meta.get("tags") or [])
 
-            # Decide group root + ensure .harness dirs
+            # decide group folder for outputs
             if args.group_by == "application":
-                app_base_root = base_out_root_for(args, app_name=app_name)
-                # seed templates per app root (once)
-                reg_path = os.path.join(app_base_root, ".harness", "template-registry.yaml")
-                if not os.path.exists(reg_path):
-                    write_common_templates_pack(app_base_root, args.org, args.project)
-                with open(reg_path, "r", encoding="utf-8") as f:
-                    registry = load_registry(reg_path)
-                services_dir, pipelines_dir = ensure_harness_dirs(app_base_root)
+                group_root = base_out_root_for(args, app_name=app_name)
             elif args.group_by == "file":
-                services_dir, pipelines_dir = ensure_harness_dirs(file_base_root)  # already seeded
+                group_root = base_out_root_for(args, file_path=path)
             else:
-                common_root = base_out_root_for(args)
-                reg_path = os.path.join(common_root, ".harness", "template-registry.yaml")
-                if not os.path.exists(reg_path):
-                    write_common_templates_pack(common_root, args.org, args.project)
-                with open(reg_path, "r", encoding="utf-8") as f:
-                    registry = load_registry(reg_path)
-                services_dir, pipelines_dir = ensure_harness_dirs(common_root)
+                group_root = base_out_root_for(args)
+
+            services_dir, pipelines_dir = ensure_harness_dirs(group_root)
 
             stages: List[Dict[str, Any]] = []
             svc_count = 0
@@ -584,16 +551,19 @@ def main() -> None:
 
                 svc_identifier = sanitize_identifier(f"{app_name}_{comp_name}")
 
+                # service
                 svc_yaml = build_service_payload(comp_name, svc_identifier, {**app_tags_map, **comp_tags_map})
                 svc_path = os.path.join(services_dir, f"{svc_identifier}.yaml")
                 write_yaml(svc_path, svc_yaml, args.org, args.project)
                 svc_count += 1; file_svcs += 1
 
+                # stage
                 matched = match_stepgroups_for_component(app_name, comp_name, app_tags_flat, comp_tags_flat, registry, first_match=args.first_match)
                 stage_name = f"Deploy {comp_name}"
-                stage = build_stage_for_component(svc_identifier, stage_name, "CustomDeployment", matched)
+                stage = build_stage_for_component(svc_identifier, stage_name, matched)
                 stages.append(stage)
 
+            # pipeline
             pipeline_name = f"{app_name} deploy"
             pipeline_id   = f"{app_name}_deploy"
             pipeline_yaml = build_pipeline_payload(pipeline_name, pipeline_id, args.org, args.project, stages, app_tags_map)
@@ -608,7 +578,7 @@ def main() -> None:
         print(f"  File summary: {file_apps} applications, {file_svcs} services")
 
     print(f"\nAll done. Processed {len(files)} file(s), {grand_apps} applications, {grand_svcs} services.")
-    print(f"Output root: {os.path.abspath(args.out)}  (group-by: {args.group_by})")
+    print(f"Output root: {out_root}  (group-by: {args.group_by})")
 
 if __name__ == "__main__":
     main()
