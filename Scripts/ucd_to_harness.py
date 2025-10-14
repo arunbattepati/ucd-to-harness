@@ -42,6 +42,11 @@ ID_RE  = re.compile(r"^[A-Za-z_][0-9A-Za-z_]{0,127}$")
 NM_RE  = re.compile(r"^[A-Za-z_0-9-.][-0-9A-Za-z_\s.]{0,127}$")
 ID_SAN = re.compile(r"[^0-9A-Za-z_]+")
 
+CUSTOM_DEPLOY_REF = "Generic_Custom_Deployment"
+FETCH_STEP_TEMPLATE_ID = "Fetch_Instances"
+FETCH_STEP_TEMPLATE_NAME = "Fetch Instances"
+FETCH_STEP_TEMPLATE_VERSION = "v1"
+
 def sanitize_name(s: str) -> str:
     s = (s or "Name")
     s = re.sub(r"[^0-9A-Za-z_\-\s.]+", " ", s)
@@ -266,9 +271,7 @@ def _fetch_instance_step() -> Dict[str, Any]:
         }
     }
 
-def build_stage_for_component(svc_identifier: str,
-                              stage_name: str,
-                              matched_stepgroups: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_stage_for_component(svc_identifier: str, stage_name: str, matched_stepgroups: List[Dict[str, Any]]) -> Dict[str, Any]:
     stage_disp_name = sanitize_name(stage_name)
     stage_ident = sanitize_identifier(stage_disp_name)
     stage = {
@@ -282,7 +285,10 @@ def build_stage_for_component(svc_identifier: str,
                     "environmentRef": "<+input>",
                     "infrastructureDefinition": {
                         "type": "CustomDeployment",
-                        "spec": { "variables": [] }
+                        "spec": {
+                            "customDeploymentRef": CUSTOM_DEPLOY_REF,   # keep this from your last fix
+                            "variables": []
+                        }
                     },
                     "allowSimultaneousDeployments": True
                 },
@@ -295,10 +301,23 @@ def build_stage_for_component(svc_identifier: str,
         }
     }
     steps = stage["stage"]["spec"]["execution"]["steps"]
-    steps.append(_fetch_instance_step())  # must be first
+
+    # First step: StepTemplateRef (not inline) → satisfies both pipelines and stage template rules
+    steps.append({
+        "step": {
+            "name": FETCH_STEP_TEMPLATE_NAME,
+            "identifier": FETCH_STEP_TEMPLATE_ID,
+            "template": {
+                "templateRef": FETCH_STEP_TEMPLATE_ID,
+                "versionLabel": FETCH_STEP_TEMPLATE_VERSION
+            }
+        }
+    })
+
+    # Then matched StepGroups (unchanged)
     for sg in matched_stepgroups or []:
         sg_name = sanitize_name(sg["name"]); sg_ident = sanitize_identifier(sg_name)
-        block: Dict[str, Any] = {
+        block = {
             "stepGroup": {
                 "name": sg_name,
                 "identifier": sg_ident,
@@ -311,6 +330,8 @@ def build_stage_for_component(svc_identifier: str,
         if "templateInputs" in sg:
             block["stepGroup"]["template"]["templateInputs"] = sg["templateInputs"]
         steps.append(block)
+
+    # Tail placeholder
     steps.append({
         "step": {
             "name": "Deploy",
@@ -323,11 +344,6 @@ def build_stage_for_component(svc_identifier: str,
             }
         }
     })
-    # Ensure exactly one Fetch at the top
-    def _is_fetch(n: Dict[str, Any]) -> bool:
-        return "step" in n and n["step"].get("type") == "FetchInstanceScript"
-    rest = [s for s in steps if not _is_fetch(s)]
-    steps.clear(); steps.append(_fetch_instance_step()); steps.extend(rest)
     return stage
 
 def build_pipeline_payload(pipeline_name: str,
@@ -353,7 +369,8 @@ def write_common_templates(out_root: str, org: str, proj: str,
     cd_dir    = os.path.join(base, "custom-deployments")
     sg_dir    = os.path.join(base, "step-groups")
     stages_dir= os.path.join(base, "stages")
-    for d in (cd_dir, sg_dir, stages_dir):
+    steps_dir  = os.path.join(base, "steps")
+    for d in (cd_dir, sg_dir, stages_dir, steps_dir):
         os.makedirs(d, exist_ok=True)
 
     # 1) Custom Deployment Template
@@ -384,7 +401,7 @@ def write_common_templates(out_root: str, org: str, proj: str,
                 "orgIdentifier": org,
                 "projectIdentifier": proj,
                 "spec": {
-                    "stageType": "Deployment",
+                    "stageType": "CustomDeployment",
                     "steps": [
                         {"step": {"type":"Run","name":"Gradle Build","identifier":"Gradle_Build",
                                   "spec":{"shell":"Bash","command":"gradle clean build"}}},
@@ -403,7 +420,7 @@ def write_common_templates(out_root: str, org: str, proj: str,
                 "orgIdentifier": org,
                 "projectIdentifier": proj,
                 "spec": {
-                    "stageType": "Deployment",
+                    "stageType": "CustomDeployment",
                     "steps": [
                         {"step":{"type":"Run","name":"Create venv & Install","identifier":"Python_Install",
                                  "spec":{"shell":"Bash","command":"python -m venv venv && . venv/bin/activate && pip install -r requirements.txt"}}},
@@ -422,7 +439,7 @@ def write_common_templates(out_root: str, org: str, proj: str,
                 "orgIdentifier": org,
                 "projectIdentifier": proj,
                 "spec": {
-                    "stageType": "Deployment",
+                    "stageType": "CustomDeployment",
                     "steps": [
                         {"step":{"type":"Run","name":"dotnet restore & build","identifier":"DotNet_Build",
                                  "spec":{"shell":"Bash","command":"dotnet restore && dotnet build --configuration Release"}}},
@@ -447,17 +464,40 @@ def write_common_templates(out_root: str, org: str, proj: str,
             "projectIdentifier": proj,
             "spec": {
                 "type": "Deployment",
+                "failureStrategies": [
+                    {
+                        "onFailure": {
+                            "errors": ["AllErrors"],
+                            "action": {"type": "StageRollback"}
+                        }
+                    }
+                ],
                 "spec": {
                     "deploymentType": "CustomDeployment",
                     "service": {"serviceRef": "<+input>"},
                     "infrastructure": {
                         "environmentRef": "<+input>",
-                        "infrastructureDefinition": {"type":"CustomDeployment","spec":{"variables":[]}},
+                        "infrastructureDefinition": {
+                            "type": "CustomDeployment",
+                            "spec": {
+                                "customDeploymentRef": CUSTOM_DEPLOY_REF,
+                                "variables": []
+                            }
+                        },
                         "allowSimultaneousDeployments": True
                     },
                     "execution": {
                         "steps": [
-                            _fetch_instance_step()
+                            {
+                                "step": {
+                                    "name": FETCH_STEP_TEMPLATE_NAME,
+                                    "identifier": FETCH_STEP_TEMPLATE_ID,
+                                    "template": {
+                                        "templateRef": FETCH_STEP_TEMPLATE_ID,
+                                        "versionLabel": FETCH_STEP_TEMPLATE_VERSION
+                                    }
+                                }
+                            }
                         ]
                     }
                 }
@@ -466,6 +506,35 @@ def write_common_templates(out_root: str, org: str, proj: str,
     }
     write_yaml(os.path.join(stages_dir, "Generic_Custom_Deployment_Stage.yaml"), stage_template, org, proj)
 
+    fetch_step_tmpl = {
+        "template": {
+            "name": FETCH_STEP_TEMPLATE_NAME,
+            "identifier": FETCH_STEP_TEMPLATE_ID,
+            "versionLabel": FETCH_STEP_TEMPLATE_VERSION,
+            "type": "Step",
+            "orgIdentifier": org,
+            "projectIdentifier": proj,
+            "spec": {
+                "type": "FetchInstanceScript",
+                "timeout": "10m",
+                "spec": {
+                    "shell": "Bash",
+                    "onDelegate": True,
+                    "source": {
+                        "type": "Inline",
+                        "spec": {
+                            "script": (
+                                'echo "Discovering instances for $HARNESS_SERVICE_NAME"\n'
+                                'echo \'{"instances":[{"name":"sample-instance","id":"1"}]}\'\n'
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+    write_yaml(os.path.join(steps_dir, f"{FETCH_STEP_TEMPLATE_ID}.yaml"), fetch_step_tmpl, org, proj)
+    
     # 4) Template registry (for StepGroup matching)
     registry_payload = {
         "templates": [
