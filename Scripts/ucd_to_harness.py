@@ -306,22 +306,42 @@ def _dedupe_and_prepend_fetch(steps: List[Dict[str, Any]]) -> None:
 def build_stage_for_component(svc_identifier: str,
                               stage_name: str,
                               matched_stepgroups: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Keep stage deployment type aligned with Service (CustomDeployment)
-    dt = "CustomDeployment"
+    """
+    Build a CustomDeployment stage that complies with Harness schema:
+      - spec.deploymentType: CustomDeployment
+      - spec.infrastructure: (NOT 'environment')
+      - spec.execution: required
+      - exactly one FetchInstanceScript as the first step
+    """
+    # Force-safe name/identifier
+    stage_disp_name = sanitize_name(stage_name)
+    stage_ident = sanitize_identifier(stage_disp_name)
+
     stage = {
         "stage": {
-            "name": sanitize_name(stage_name),
-            "identifier": sanitize_identifier(stage_name),
+            "name": stage_disp_name,
+            "identifier": stage_ident,
             "type": "Deployment",
             "spec": {
-                "deploymentType": dt,
-                "service": {"serviceRef": svc_identifier},
-                "environment": {
-                    "environmentRef": "<+input>",
-                    "deployToAll": True,
-                    "infrastructureDefinitions": [{"identifier": "<+input>"}],
+                "deploymentType": "CustomDeployment",
+                # IMPORTANT: For CustomDeployment, 'infrastructure' (not 'environment') is required
+                "infrastructure": {
+                    "environmentRef": "<+input>",  # you pick env at runtime
+                    "infrastructureDefinition": {
+                        "type": "CustomDeployment",
+                        "spec": {
+                            # For minimal validity; customize per your template’s infra model if needed
+                            "variables": []
+                        }
+                    },
+                    "allowSimultaneousDeployments": True
                 },
-                "execution": {"steps": []},
+                "service": {
+                    "serviceRef": svc_identifier
+                },
+                "execution": {
+                    "steps": []
+                }
             },
             "failureStrategies": [
                 {
@@ -333,17 +353,25 @@ def build_stage_for_component(svc_identifier: str,
             ]
         }
     }
+
     steps = stage["stage"]["spec"]["execution"]["steps"]
 
-    # 1) Guarantee exactly one FetchInstanceScript at top
-    _dedupe_and_prepend_fetch(steps)
+    # 1) Ensure exactly one FetchInstanceScript at top
+    def _is_fetch_step(node: Dict[str, Any]) -> bool:
+        return "step" in node and node["step"].get("type") == "FetchInstanceScript"
 
-    # 2) Add matched StepGroups (if any)
+    # Start with a clean slate (we control the order)
+    steps.clear()
+    steps.append(_fetch_instance_step())  # first step must be FetchInstanceScript
+
+    # 2) Add matched StepGroups
     for sg in matched_stepgroups:
+        sg_name = sanitize_name(sg["name"])
+        sg_ident = sanitize_identifier(sg_name)
         block: Dict[str, Any] = {
             "stepGroup": {
-                "name": sanitize_name(sg["name"]),
-                "identifier": sanitize_identifier(sg["name"]),
+                "name": sg_name,
+                "identifier": sg_ident,
                 "template": {
                     "templateRef": sg["templateRef"],
                     "versionLabel": sg.get("versionLabel", "v1")
@@ -354,7 +382,7 @@ def build_stage_for_component(svc_identifier: str,
             block["stepGroup"]["template"]["templateInputs"] = sg["templateInputs"]
         steps.append(block)
 
-    # 3) End with a no-op placeholder
+    # 3) Tail placeholder (safe no-op)
     steps.append({
         "step": {
             "name": "Deploy",
@@ -368,9 +396,14 @@ def build_stage_for_component(svc_identifier: str,
         }
     })
 
-    # Final guard
-    if _count_fetch_steps(steps) != 1 or not (steps and steps[0].get("step", {}).get("type") == "FetchInstanceScript"):
-        _dedupe_and_prepend_fetch(steps)
+    # Final guard: confirm first step is exactly one FetchInstanceScript
+    fetch_count = sum(1 for s in steps if _is_fetch_step(s))
+    if fetch_count != 1 or not _is_fetch_step(steps[0]):
+        # Rebuild: put a single Fetch at the top and remove any duplicates
+        rest = [s for s in steps if not _is_fetch_step(s)]
+        steps.clear()
+        steps.append(_fetch_instance_step())
+        steps.extend(rest)
 
     return stage
 
