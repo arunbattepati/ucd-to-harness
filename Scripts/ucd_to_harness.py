@@ -13,8 +13,6 @@ UCD → Harness NG converter (multi-file, clean YAML, reusable templates)
 - Matches reusable StepGroup templates via .harness/template-registry.yaml.
 - Re-parses written YAML for quick validation.
 
-Examples:
-
 Examples
 --------
 # Sweep a directory of UCD exports and group output per file
@@ -104,7 +102,7 @@ def _walk_fix_ids_and_names(obj: Any) -> None:
 # --------------------------------------------------------------------
 VALID_DEPLOYMENT_TYPES = {
     # keep a conservative list; fall back to Custom when unsure
-    "Custom", "WinRm", "TAS", "Kubernetes", "SSH", "NativeHelm", "ECS", "AzureWebApp", "ServerlessAwsLambda"
+    "CustomDeployment", "WinRm", "TAS", "Kubernetes", "SSH", "NativeHelm", "ECS", "AzureWebApp", "ServerlessAwsLambda", "GoogleCloudRun"
 }
 SYNONYMS = {
     "pcf": "TAS", "tanzu": "TAS", "cloud foundry": "TAS", "tas": "TAS",
@@ -117,18 +115,18 @@ def infer_deployment_type(app_tags: List[str], comp_tags: List[str]) -> str:
     for key, val in SYNONYMS.items():
         if key in hay:
             return val
-    return "Custom"
+    return "CustomDeployment"
 
 def normalize_deployment_type(dt: Optional[str]) -> str:
     if not dt:
-        return "Custom"
+        return "CustomDeployment"
     if dt not in VALID_DEPLOYMENT_TYPES:
         # try mapping synonyms
         low = dt.lower()
         for k, v in SYNONYMS.items():
             if k == low:
                 return v
-        return "Custom"
+        return "CustomDeployment"
     return dt
 
 # --------------------------------------------------------------------
@@ -292,6 +290,31 @@ def build_service_payload(name: str, identifier: str, tags_map: Dict[str, str]) 
         }
     }
 
+def _fetch_instance_step() -> Dict[str, Any]:
+    """PATCH: Required once per CustomDeployment stage to satisfy Harness validator."""
+    return {
+        "step": {
+            "name": "Fetch Instances",
+            "identifier": "Fetch_Instances",
+            "type": "FetchInstanceScript",
+            "timeout": "10m",
+            "spec": {
+                "shell": "Bash",
+                "onDelegate": True,
+                "source": {
+                    "type": "Inline",
+                    "spec": {
+                        # Minimal valid output; replace with real discovery as you implement
+                        "script": (
+                            'echo "Fetching instances for $HARNESS_SERVICE_NAME..."\n'
+                            'echo \'{"instances":[{"name":"sample-instance","id":"1"}]}\'\n'
+                        )
+                    }
+                }
+            }
+        }
+    }
+
 def build_stage_for_component(svc_identifier: str,
                               stage_name: str,
                               deployment_type: str,
@@ -324,6 +347,12 @@ def build_stage_for_component(svc_identifier: str,
         }
     }
     steps = stage["stage"]["spec"]["execution"]["steps"]
+
+    # --- PATCH: Inject exactly one FetchInstanceScript for CustomDeployment ---
+    if dt == "CustomDeployment":
+        steps.append(_fetch_instance_step())
+
+    # Matched reusable StepGroups from registry
     for sg in matched_stepgroups:
         sg_name = sg["name"]
         block = {
