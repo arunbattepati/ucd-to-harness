@@ -40,20 +40,43 @@ NM_RE  = re.compile(r"^[A-Za-z_0-9-.][-0-9A-Za-z_\\s.]{0,127}$")
 ID_SAN = re.compile(r"[^0-9A-Za-z_]+")
 
 def sanitize_name(s: str) -> str:
-    s = (s or "Name").strip()
-    s = s.replace("/", " ").replace("\\", " ").replace("(", " ").replace(")", " ")
+    """
+    Produce a Harness-safe display name that matches:
+      ^[A-Za-z_][-0-9A-Za-z_\\s]{0,127}$
+    (letters/underscore first; then letters/digits/underscore/space/hyphen)
+    """
+    s = (s or "Name")
+    # Replace anything not allowed in name with space
     s = re.sub(r"[^0-9A-Za-z_\-\s.]+", " ", s)
+    # Dots are NOT allowed by the stage name regex → turn them into spaces
+    s = s.replace(".", " ")
+    # Collapse whitespace, trim
     s = re.sub(r"\s+", " ", s).strip()
-    if not s:
-        s = "Name"
-    s = s[:128]
-    if not NM_RE.match(s):
-        s = s.lstrip()
-        if not s or not re.match(r"[A-Za-z_0-9-.]", s[0]):
-            s = "_" + s
-        s = s[:128]
-    if not NM_RE.match(s):
-        s = re.sub(r"_+", " ", ID_SAN.sub("_", s))[:128] or "Name"
+
+    # Ensure first char is A-Za-z_ ; if not, prefix with '_'
+    if not s or not re.match(r"[A-Za-z_]", s[0]):
+        s = "_" + s
+
+    # Now remove any char beyond the allowed set (second+): [-0-9A-Za-z_\s]
+    # (we already converted dots and weird chars above)
+    s2 = [s[0]]
+    for ch in s[1:]:
+        if re.match(r"[-0-9A-Za-z_\s]", ch):
+            s2.append(ch)
+        else:
+            s2.append(" ")
+    s = "".join(s2)
+
+    # Collapse again and trim to max 128
+    s = re.sub(r"\s+", " ", s).strip()[:128]
+    # Final guard
+    if not re.match(r"^[A-Za-z_][-0-9A-Za-z_\s]{0,127}$", s):
+        # As a fallback, convert spaces to single space and ensure length
+        s = re.sub(r"[^-0-9A-Za-z_\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()[:128]
+        if not s or not re.match(r"[A-Za-z_]", s[0]):
+            s = "_" + (s or "Name")
+            s = s[:128]
     return s
 
 def sanitize_identifier(s: str) -> str:
