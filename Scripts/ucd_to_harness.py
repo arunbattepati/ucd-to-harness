@@ -3,23 +3,15 @@
 """
 UCD → Harness YAML Converter (import-ready; no manual edits required)
 
-Output layout:
-  <out>/
-    common_templates/                 # shared templates (de-duped by identifier)
-    <app>/
-      services/
-      environments/
-      infrastructures/
-      pipelines/
-      input_sets/
-
-Top-level YAML entity keys supported:
-  - template
-  - service
-  - environment
-  - infrastructureDefinition
-  - pipeline
-  - inputSet
+Key features:
+- Recursively reads input dir (supports nested folders).
+- Accepts many UCD shapes: {"applications":[...]}, {"Applications":[...]}, {"ucdExport":{...}},
+  or single-entity files (pipeline/template/service/environment/infrastructureDefinition/inputSet).
+- Outputs to:
+    <out>/common_templates/
+    <out>/<app>/{services,environments,infrastructures,pipelines,input_sets}/
+- Ensures Harness-importable YAML (--- header, .yaml extension, sanitized identifiers).
+- Adds --verbose to print per-file stats & warnings.
 
 Usage:
   python Scripts/ucd_to_harness_yaml_converter.py \
@@ -27,7 +19,8 @@ Usage:
     --out harness_out \
     --org default \
     --project ucd2harnessmigration \
-    --group-by application
+    --group-by application \
+    --verbose
 """
 
 from __future__ import annotations
@@ -40,13 +33,10 @@ import sys
 
 try:
     import yaml  # PyYAML
-except Exception as e:
+except Exception:
     print("ERROR: PyYAML is required. Install with: pip install pyyaml", file=sys.stderr)
     raise
 
-# ---------------------------
-# Config / constants
-# ---------------------------
 SUPPORTED_TOP_KEYS = {
     "template",
     "service",
@@ -56,14 +46,10 @@ SUPPORTED_TOP_KEYS = {
     "inputSet",
 }
 
-# ---------------------------
-# Identifier utilities
-# ---------------------------
 _IDENT_RX_ALLOWED = re.compile(r"[^A-Za-z0-9_]")
 _IDENT_RX_LEAD = re.compile(r"^[A-Za-z]")
 
 def to_identifier(s: str) -> str:
-    """Harness identifiers must contain only letters/numbers/underscore and start with a letter."""
     s = (s or "").strip()
     s = _IDENT_RX_ALLOWED.sub("_", s)
     s = re.sub(r"_+", "_", s)
@@ -76,9 +62,6 @@ def to_safe_filename(*parts: str) -> str:
     base = "_".join(segs) or "artifact"
     return f"{base}.yaml"
 
-# ---------------------------
-# YAML writer
-# ---------------------------
 def yaml_write(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not str(path).lower().endswith(".yaml"):
@@ -87,9 +70,6 @@ def yaml_write(path: Path, obj: dict) -> None:
         f.write("---\n")
         yaml.safe_dump(obj, f, sort_keys=False)
 
-# ---------------------------
-# Writer orchestrating layout
-# ---------------------------
 class Writer:
     def __init__(self, out_root: Path) -> None:
         self.root = out_root
@@ -150,12 +130,7 @@ class Writer:
         yaml_write(out, {"inputSet": i})
         return out
 
-# ---------------------------
-# Normalization helpers
-# ---------------------------
 def ensure_org_project(entity: dict, org: str, project: str) -> None:
-    """Inject orgIdentifier/projectIdentifier where applicable (no override)."""
-    # Detect the sole top-level key
     keys = [k for k in entity.keys() if k in SUPPORTED_TOP_KEYS]
     if not keys:
         return
@@ -163,15 +138,12 @@ def ensure_org_project(entity: dict, org: str, project: str) -> None:
     body = entity[k]
     if not isinstance(body, dict):
         return
-
-    # Not all entity types require both, but setting both is safe
     if "orgIdentifier" not in body:
         body["orgIdentifier"] = org
-    if "projectIdentifier" not in body and k != "template":  # templates can be org/project scoped; leave as-is if absent
+    if "projectIdentifier" not in body and k != "template":
         body["projectIdentifier"] = project
 
 def normalize_identifiers(entity: dict, app: str) -> None:
-    """Sanitize names and identifiers for imported entities."""
     keys = [k for k in entity.keys() if k in SUPPORTED_TOP_KEYS]
     if not keys:
         return
@@ -179,8 +151,6 @@ def normalize_identifiers(entity: dict, app: str) -> None:
     body = entity[k]
     if not isinstance(body, dict):
         return
-
-    # id rules
     default_suffix = {
         "template": "Template",
         "service": "service",
@@ -189,16 +159,10 @@ def normalize_identifiers(entity: dict, app: str) -> None:
         "pipeline": "pipeline",
         "inputSet": "inputs",
     }[k]
-
     body["identifier"] = to_identifier(body.get("identifier") or body.get("name") or f"{app}_{default_suffix}")
-
-    # For templates ensure versionLabel
     if k == "template":
         body["versionLabel"] = body.get("versionLabel") or "v1"
 
-# ---------------------------
-# Input reading (dir/file; json/yaml)
-# ---------------------------
 def _load_one(p: Path) -> Union[List[dict], dict]:
     text = p.read_text(encoding="utf-8")
     if p.suffix.lower() in (".yaml", ".yml"):
@@ -207,62 +171,99 @@ def _load_one(p: Path) -> Union[List[dict], dict]:
         data = json.loads(text)
     return data
 
-def read_input_dir_or_file(path: Path) -> List[dict]:
+def _explode_known_ucd_shapes(obj: Any, verbose: bool, src: Path) -> List[dict]:
     """
-    Accepts:
-      - directory containing multiple *.json/*.yaml files
-      - single file (json/yaml) with either a list[dict] or a single dict
-    Returns a list of "UCD units". Each unit should contain enough info to identify the application.
+    Convert various UCD export shapes into a list of 'units' (each roughly one application).
+    Supported patterns:
+      - {"applications":[{...},{...}]}
+      - {"Applications":[{...},{...}]}
+      - {"ucdExport":{"applications":[...]}} or similar
+      - a single entity dict with a top-level supported key (treated as one app)
+      - already a "unit-like" dict (has app/application/applicationName/name + lists)
+    """
+    units: List[dict] = []
+
+    def _is_entity_dict(d: dict) -> bool:
+        return any(k in d for k in SUPPORTED_TOP_KEYS)
+
+    if isinstance(obj, list):
+        # Could be already a list of units or a list of entities
+        # If items look like top-level entities, wrap as one unit named 'application'
+        if obj and all(isinstance(x, dict) and _is_entity_dict(x) for x in obj):
+            units.append({"app": "application", "entities": obj})
+            return units
+        # Otherwise treat each as a unit (best-effort)
+        for x in obj:
+            if isinstance(x, dict):
+                units.append(x)
+        return units
+
+    if not isinstance(obj, dict):
+        return units
+
+    # Direct applications key (lower/upper)
+    for key in ("applications", "Applications"):
+        if key in obj and isinstance(obj[key], list):
+            for app_item in obj[key]:
+                if isinstance(app_item, dict):
+                    units.append(app_item)
+            return units
+
+    # Nested export object
+    if "ucdExport" in obj and isinstance(obj["ucdExport"], dict):
+        nested = obj["ucdExport"]
+        for key in ("applications", "Applications"):
+            if key in nested and isinstance(nested[key], list):
+                for app_item in nested[key]:
+                    if isinstance(app_item, dict):
+                        units.append(app_item)
+                return units
+        # fallback: treat nested dict itself as unit
+        units.append(nested)
+        return units
+
+    # Single-entity file (e.g., only a pipeline)
+    if _is_entity_dict(obj):
+        units.append({"app": obj.get("applicationName") or obj.get("name") or "application", "entities": [obj]})
+        return units
+
+    # Default: assume already a unit-ish dict
+    units.append(obj)
+    return units
+
+def read_input_dir_or_file(path: Path, verbose: bool) -> Tuple[List[dict], List[Tuple[Path, int]]]:
+    """
+    Returns (units, per_file_counts) where per_file_counts holds (#units derived) for logging.
+    Recursively scans directories for *.json/*.yaml/*.yml.
     """
     if not path.exists():
         raise FileNotFoundError(f"Input not found: {path}")
 
-    raw_items: List[dict] = []
+    files: List[Path] = []
     if path.is_dir():
-        files = sorted(list(path.glob("*.json")) + list(path.glob("*.yaml")) + list(path.glob("*.yml")))
+        files = sorted(list(path.rglob("*.json")) + list(path.rglob("*.yaml")) + list(path.rglob("*.yml")))
         if not files:
-            raise FileNotFoundError(f"No .json/.yaml files in {path}")
-        for f in files:
-            data = _load_one(f)
-            if isinstance(data, list):
-                raw_items.extend(data)
-            elif isinstance(data, dict):
-                raw_items.append(data)
-            else:
-                raise ValueError(f"Unsupported structure in {f}")
+            raise FileNotFoundError(f"No .json/.yaml files found recursively under {path}")
     else:
-        data = _load_one(path)
-        if isinstance(data, list):
-            raw_items.extend(data)
-        elif isinstance(data, dict):
-            raw_items.append(data)
-        else:
-            raise ValueError(f"Unsupported structure in {path}")
+        files = [path]
 
-    return raw_items
+    units: List[dict] = []
+    per_file_counts: List[Tuple[Path, int]] = []
 
-# ---------------------------
-# UCD → Harness mapping (keeps your shapes if already Harness-like)
-# ---------------------------
+    for f in files:
+        try:
+            data = _load_one(f)
+            exploded = _explode_known_ucd_shapes(data, verbose, f)
+            units.extend(exploded)
+            per_file_counts.append((f, len(exploded)))
+        except Exception as e:
+            per_file_counts.append((f, 0))
+            if verbose:
+                print(f"[WARN] Skipped {f}: {e}", file=sys.stderr)
+
+    return units, per_file_counts
+
 def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "app": "<name>",
-        "templates": [ {template: {...}}, ... ],
-        "services":  [ {service: {...}}, ... ],
-        "environments": [ {environment: {...}}, ... ],
-        "infrastructures": [ {infrastructureDefinition: {...}}, ... ],
-        "pipelines": [ {pipeline: {...}}, ... ],
-        "input_sets": [ {inputSet: {...}}, ... ],
-      }
-
-    Notes:
-    - If your UCD item already holds Harness-shaped dicts, we just pass and normalize.
-    - If it holds simple dicts, we wrap them into correct top-level keys.
-    - Tries to derive the application name from common fields.
-    """
-    # derive app name
     app = (
         ucd.get("app")
         or ucd.get("application")
@@ -271,6 +272,13 @@ def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
         or "application"
     )
     app = str(app)
+
+    # Some shapes may place raw entity dicts under 'entities'
+    entities_from_flat: List[dict] = []
+    if isinstance(ucd.get("entities"), list):
+        for e in ucd["entities"]:
+            if isinstance(e, dict) and any(k in e for k in SUPPORTED_TOP_KEYS):
+                entities_from_flat.append(e)
 
     def wrap_list(key: str, items: List[dict], default_builder) -> List[dict]:
         out = []
@@ -281,10 +289,35 @@ def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
                 out.append(default_builder(it))
         return out
 
-    # defaults to ensure shape if not already Harness-like
+    # Prefer explicit lists if present, otherwise mine from flat entities
+    raw_tmpls = ucd.get("templates", [])
+    raw_svcs = ucd.get("services", [])
+    raw_envs = ucd.get("environments", [])
+    raw_infras = ucd.get("infrastructures", [])
+    raw_pipes = ucd.get("pipelines", [])
+    raw_inputs = ucd.get("input_sets", []) or ucd.get("inputSets", [])
+
+    # Sweep flat entities into respective buckets if not already populated
+    if entities_from_flat:
+        for ent in entities_from_flat:
+            for k in SUPPORTED_TOP_KEYS:
+                if k in ent:
+                    if k == "template":
+                        raw_tmpls.append(ent); break
+                    if k == "service":
+                        raw_svcs.append(ent); break
+                    if k == "environment":
+                        raw_envs.append(ent); break
+                    if k == "infrastructureDefinition":
+                        raw_infras.append(ent); break
+                    if k == "pipeline":
+                        raw_pipes.append(ent); break
+                    if k == "inputSet":
+                        raw_inputs.append(ent); break
+
     templates = wrap_list(
         "template",
-        ucd.get("templates", []),
+        raw_tmpls,
         lambda t: {
             "template": {
                 "name": t.get("name", "Template"),
@@ -298,7 +331,7 @@ def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
 
     services = wrap_list(
         "service",
-        ucd.get("services", []),
+        raw_svcs,
         lambda s: {
             "service": {
                 "name": s.get("name", f"{app}-service"),
@@ -312,7 +345,7 @@ def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
 
     environments = wrap_list(
         "environment",
-        ucd.get("environments", []),
+        raw_envs,
         lambda e: {
             "environment": {
                 "name": e.get("name", f"{app}-env"),
@@ -326,7 +359,7 @@ def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
 
     infrastructures = wrap_list(
         "infrastructureDefinition",
-        ucd.get("infrastructures", []),
+        raw_infras,
         lambda i: {
             "infrastructureDefinition": {
                 "name": i.get("name", f"{app}-infra"),
@@ -342,7 +375,7 @@ def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
 
     pipelines = wrap_list(
         "pipeline",
-        ucd.get("pipelines", []),
+        raw_pipes,
         lambda p: {
             "pipeline": {
                 "name": p.get("name", f"{app} deploy"),
@@ -357,7 +390,7 @@ def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
 
     input_sets = wrap_list(
         "inputSet",
-        ucd.get("input_sets", []) or ucd.get("inputSets", []),
+        raw_inputs,
         lambda i: {
             "inputSet": {
                 "name": i.get("name", f"{app} Inputs"),
@@ -370,7 +403,7 @@ def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
         },
     )
 
-    # Normalize all entities (ids & org/project injection)
+    # Normalize & inject org/project
     all_lists = [templates, services, environments, infrastructures, pipelines, input_sets]
     for lst in all_lists:
         for entity in lst:
@@ -387,22 +420,16 @@ def map_ucd_unit(ucd: dict, org: str, project: str) -> Dict[str, Any]:
         "input_sets": input_sets,
     }
 
-# ---------------------------
-# Conversion driver
-# ---------------------------
 def convert_all(ucd_units: Iterable[dict], writer: Writer, org: str, project: str) -> List[Tuple[str, Path]]:
     results: List[Tuple[str, Path]] = []
     for unit in ucd_units:
         mapped = map_ucd_unit(unit, org, project)
         app = mapped["app"]
 
-        # Common templates (de-dup across apps)
         for tpl in mapped["templates"]:
             p = writer.write_template(tpl)
             if p:
                 results.append(("template", p))
-
-        # Per-app items
         for svc in mapped["services"]:
             results.append(("service", writer.write_service(app, svc)))
         for env in mapped["environments"]:
@@ -416,35 +443,45 @@ def convert_all(ucd_units: Iterable[dict], writer: Writer, org: str, project: st
 
     return results
 
-# ---------------------------
-# CLI
-# ---------------------------
 def main(argv: List[str]) -> None:
-    ap = argparse.ArgumentParser(description="UCD → Harness YAML converter (import-ready)")
-    ap.add_argument("--input-dir", required=True, help="Directory or file containing UCD JSON/YAML")
+    ap = argparse.ArgumentParser(description="UCD → Harness YAML converter (import-ready; recursive input scanning)")
+    ap.add_argument("--input-dir", required=True, help="Directory or file containing UCD JSON/YAML (scanned recursively for dirs)")
     ap.add_argument("--out", required=True, help="Output root (e.g., harness_out)")
     ap.add_argument("--org", default="default", help="Harness orgIdentifier (default: default)")
     ap.add_argument("--project", default="ucd2harnessmigration", help="Harness projectIdentifier (default: ucd2harnessmigration)")
     ap.add_argument("--group-by", default="application", help="Grouping mode (currently informational; default: application)")
+    ap.add_argument("--verbose", action="store_true", help="Print per-file diagnostics")
     args = ap.parse_args(argv[1:])
 
     input_path = Path(args.input_dir)
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    ucd_units = read_input_dir_or_file(input_path)
-    writer = Writer(out_root)
+    ucd_units, per_file_counts = read_input_dir_or_file(input_path, args.verbose)
+    if args.verbose:
+        for f, n in per_file_counts:
+            print(f"[scan] {f} -> {n} unit(s)")
 
+    writer = Writer(out_root)
     results = convert_all(ucd_units, writer, args.org, args.project)
 
-    # Summary
     counts: Dict[str, int] = {}
     for kind, _ in results:
         counts[kind] = counts.get(kind, 0) + 1
 
-    print(f"[OK] Wrote {len(results)} YAMLs to {out_root.resolve()}")
+    total = len(results)
+    print(f"[OK] Wrote {total} YAMLs to {out_root.resolve()}")
     if counts:
         print("Counts:", ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    if total == 0:
+        print(
+            "[HINT] No entities were emitted.\n"
+            "  • Ensure your files contain at least one of: template/service/environment/infrastructureDefinition/pipeline/inputSet\n"
+            "  • If your export is nested (e.g., {'ucdExport': {'applications': [...]}}), this script now handles it.\n"
+            "  • Use --verbose to see how each file was interpreted.\n"
+            "  • Verify --input-dir points to the folder/files with UCD exports (this script scans recursively).",
+            file=sys.stderr,
+        )
 
 if __name__ == "__main__":
     main(sys.argv)
